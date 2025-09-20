@@ -10,6 +10,7 @@ require (
 	github.com/joho/godotenv v1.5.1
 	github.com/nats-io/nats.go v1.45.0
 	github.com/tendant/simple-content v0.1.3
+	github.com/tendant/simple-process v0.0.4
 )
 
 require (
