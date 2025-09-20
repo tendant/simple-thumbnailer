@@ -1,4 +1,4 @@
-module github.com/tendnat/simple-thumbnailer
+module github.com/tendant/simple-thumbnailer
 
 go 1.23.0
 
