@@ -1,6 +1,6 @@
-module image-thumbnailer
+module github.com/tendnat/simple-thumbnailer
 
-go 1.22
+go 1.24
 
 require (
 	github.com/disintegration/imaging v1.6.2
@@ -10,5 +10,3 @@ require (
 	github.com/tendant/simple-process v0.0.0-00010101000000-000000000000
 )
 
-replace github.com/tendant/simple-content => github.com/tendant/simple-content latest
-replace github.com/tendant/simple-process => github.com/tendant/simple-process latest
