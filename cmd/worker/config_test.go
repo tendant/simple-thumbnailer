@@ -17,8 +17,14 @@ func TestLoadConfigDefaults(t *testing.T) {
 	if cfg.NATSURL != "nats://127.0.0.1:4222" {
 		t.Fatalf("unexpected NATS URL: %s", cfg.NATSURL)
 	}
-	if cfg.SubjectIn != "images.uploaded" || cfg.SubjectOut != "images.thumbnail.done" {
-		t.Fatalf("unexpected subjects: %s %s", cfg.SubjectIn, cfg.SubjectOut)
+	if cfg.JobSubject != "simple-process.jobs" {
+		t.Fatalf("unexpected job subject: %s", cfg.JobSubject)
+	}
+	if cfg.WorkerQueue != "thumbnail-workers" {
+		t.Fatalf("unexpected worker queue: %s", cfg.WorkerQueue)
+	}
+	if cfg.ResultSubject != "images.thumbnail.done" {
+		t.Fatalf("unexpected result subject: %s", cfg.ResultSubject)
 	}
 	if cfg.ThumbDir != "./data/thumbs" {
 		t.Fatalf("unexpected thumb dir: %s", cfg.ThumbDir)

@@ -4,7 +4,7 @@ tidy:
 	go mod tidy
 
 run-worker:
-	go run ./cmd/worker
+	go run -tags nats ./cmd/worker
 
 up:
 	docker compose up -d

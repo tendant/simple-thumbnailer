@@ -23,7 +23,13 @@ func Connect(url string) (*Client, error) {
 	return &Client{nc: nc}, nil
 }
 
-func (c *Client) Close() { if c.nc != nil { _ = c.nc.Drain() } }
+func (c *Client) Close() {
+	if c.nc != nil {
+		_ = c.nc.Drain()
+	}
+}
+
+func (c *Client) Conn() *nats.Conn { return c.nc }
 
 func (c *Client) PublishJSON(subject string, v any) error {
 	b, err := json.Marshal(v)

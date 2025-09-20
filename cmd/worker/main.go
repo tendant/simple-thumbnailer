@@ -1,9 +1,10 @@
+//go:build nats
+
 // cmd/worker/main.go
 package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log"
 	"os"
@@ -14,22 +15,25 @@ import (
 	"github.com/google/uuid"
 	"github.com/joho/godotenv"
 
+	simplecontent "github.com/tendant/simple-content/pkg/simplecontent"
 	simpleconfig "github.com/tendant/simple-content/pkg/simplecontent/config"
+	"github.com/tendant/simple-process/pkg/contracts"
+	natsbus "github.com/tendant/simple-process/pkg/transports/nats"
 
 	"github.com/tendant/simple-thumbnailer/internal/bus"
 	"github.com/tendant/simple-thumbnailer/internal/img"
-	"github.com/tendant/simple-thumbnailer/internal/process"
 	"github.com/tendant/simple-thumbnailer/internal/upload"
 	"github.com/tendant/simple-thumbnailer/pkg/schema"
 )
 
 type config struct {
-	NATSURL     string
-	SubjectIn   string
-	SubjectOut  string
-	ThumbDir    string
-	ThumbWidth  int
-	ThumbHeight int
+	NATSURL       string
+	JobSubject    string
+	WorkerQueue   string
+	ResultSubject string
+	ThumbDir      string
+	ThumbWidth    int
+	ThumbHeight   int
 }
 
 func main() {
@@ -62,86 +66,8 @@ func main() {
 	}
 	defer nc.Close()
 
-	_, err = nc.SubscribeJSON(cfg.SubjectIn, func(_ context.Context, data []byte) {
-		var evt schema.ImageUploaded
-		if err := json.Unmarshal(data, &evt); err != nil {
-			log.Printf("bad message: %v", err)
-			return
-		}
-
-		job := process.NewJob("thumbnail", evt.ID, evt)
-		process.MarkRunning(job)
-
-		ctx := context.Background()
-
-		contentID, err := uuid.Parse(evt.ID)
-		if err != nil {
-			process.MarkFailed(job, fmt.Errorf("invalid content id: %w", err))
-			publishError(nc, cfg.SubjectOut, evt, err)
-			return
-		}
-
-		parent, err := contentSvc.GetContent(ctx, contentID)
-		if err != nil {
-			process.MarkFailed(job, fmt.Errorf("fetch content: %w", err))
-			publishError(nc, cfg.SubjectOut, evt, err)
-			return
-		}
-
-		source, cleanup, err := uploader.FetchSource(ctx, contentID)
-		if err != nil {
-			process.MarkFailed(job, fmt.Errorf("fetch source: %w", err))
-			publishError(nc, cfg.SubjectOut, evt, err)
-			return
-		}
-		defer cleanup()
-
-		name := evt.Filename
-		if name == "" {
-			name = source.Filename
-		}
-		thumbPath := buildThumbPath(cfg.ThumbDir, evt.ID, name)
-		defer os.Remove(thumbPath)
-		if err := os.MkdirAll(filepath.Dir(thumbPath), 0o755); err != nil {
-			process.MarkFailed(job, fmt.Errorf("ensure thumb dir: %w", err))
-			publishError(nc, cfg.SubjectOut, evt, err)
-			return
-		}
-
-		w, h, err := img.GenerateThumbnail(source.Path, thumbPath, cfg.ThumbWidth, cfg.ThumbHeight)
-		done := schema.ThumbnailDone{
-			ID:         evt.ID,
-			SourcePath: evt.Path,
-			ThumbPath:  thumbPath,
-			Width:      w,
-			Height:     h,
-			HappenedAt: time.Now().Unix(),
-		}
-
-		if err != nil {
-			process.MarkFailed(job, err)
-			done.Error = err.Error()
-		} else {
-			result, upErr := uploader.UploadThumbnail(ctx, parent, thumbPath, upload.UploadOptions{
-				FileName: filepath.Base(thumbPath),
-				MimeType: source.MimeType,
-				Width:    w,
-				Height:   h,
-			})
-			if upErr != nil {
-				process.MarkFailed(job, upErr)
-				done.Error = upErr.Error()
-			} else {
-				process.MarkSucceeded(job)
-				done.UploadURL = result.DownloadURL
-			}
-		}
-
-		if err := nc.PublishJSON(cfg.SubjectOut, done); err != nil {
-			log.Printf("publish done failed: %v", err)
-		} else {
-			log.Printf("job result: %+v", done)
-		}
+	_, err = natsbus.SubscribeWorker(nc.Conn(), cfg.JobSubject, cfg.WorkerQueue, func(jobCtx context.Context, job contracts.Job) error {
+		return handleJob(jobCtx, job, cfg, contentSvc, uploader, nc)
 	})
 	if err != nil {
 		log.Fatal(err)
@@ -150,12 +76,106 @@ func main() {
 	select {}
 }
 
+func handleJob(ctx context.Context, job contracts.Job, cfg config, contentSvc simplecontent.Service, uploader *upload.Client, nc *bus.Client) error {
+	sourcePath := job.File.Blob.Location
+
+	contentIDValue := ""
+	if job.File.Attributes != nil {
+		if v, ok := job.File.Attributes["content_id"]; ok {
+			if s, ok := v.(string); ok {
+				contentIDValue = s
+			}
+		}
+	}
+	if contentIDValue == "" {
+		contentIDValue = job.File.ID
+	}
+	if contentIDValue == "" {
+		err := fmt.Errorf("job %s missing content_id", job.JobID)
+		publishThumbnailEvent(nc, cfg.ResultSubject, job.JobID, sourcePath, "", "", 0, 0, err)
+		return err
+	}
+
+	contentID, err := uuid.Parse(contentIDValue)
+	if err != nil {
+		publishThumbnailEvent(nc, cfg.ResultSubject, contentIDValue, sourcePath, "", "", 0, 0, err)
+		return fmt.Errorf("parse content id: %w", err)
+	}
+
+	parent, err := contentSvc.GetContent(ctx, contentID)
+	if err != nil {
+		publishThumbnailEvent(nc, cfg.ResultSubject, contentID.String(), sourcePath, "", "", 0, 0, err)
+		return fmt.Errorf("fetch content: %w", err)
+	}
+
+	source, cleanup, err := uploader.FetchSource(ctx, contentID)
+	if err != nil {
+		publishThumbnailEvent(nc, cfg.ResultSubject, contentID.String(), sourcePath, "", "", 0, 0, err)
+		return fmt.Errorf("fetch source: %w", err)
+	}
+	defer cleanup()
+
+	width := cfg.ThumbWidth
+	if w := parseHintInt(job.Hints, "thumbnail_width"); w > 0 {
+		width = w
+	}
+	height := cfg.ThumbHeight
+	if h := parseHintInt(job.Hints, "thumbnail_height"); h > 0 {
+		height = h
+	}
+
+	name := job.File.Name
+	if name == "" && job.File.Attributes != nil {
+		if v, ok := job.File.Attributes["filename"].(string); ok && v != "" {
+			name = v
+		}
+	}
+	if name == "" {
+		name = source.Filename
+	}
+	if name == "" && sourcePath != "" {
+		name = filepath.Base(sourcePath)
+	}
+	if name == "" {
+		name = "thumbnail.png"
+	}
+
+	thumbPath := buildThumbPath(cfg.ThumbDir, contentID.String(), name)
+	defer os.Remove(thumbPath)
+	if err := os.MkdirAll(filepath.Dir(thumbPath), 0o755); err != nil {
+		publishThumbnailEvent(nc, cfg.ResultSubject, contentID.String(), sourcePath, "", "", 0, 0, err)
+		return fmt.Errorf("ensure thumb dir: %w", err)
+	}
+
+	w, h, err := img.GenerateThumbnail(source.Path, thumbPath, width, height)
+	if err != nil {
+		publishThumbnailEvent(nc, cfg.ResultSubject, contentID.String(), sourcePath, "", "", width, height, err)
+		return fmt.Errorf("generate thumbnail: %w", err)
+	}
+
+	result, err := uploader.UploadThumbnail(ctx, parent, thumbPath, upload.UploadOptions{
+		FileName: name,
+		MimeType: source.MimeType,
+		Width:    w,
+		Height:   h,
+	})
+	if err != nil {
+		publishThumbnailEvent(nc, cfg.ResultSubject, contentID.String(), sourcePath, "", "", w, h, err)
+		return fmt.Errorf("upload thumbnail: %w", err)
+	}
+
+	publishThumbnailEvent(nc, cfg.ResultSubject, contentID.String(), sourcePath, result.Content.ID.String(), result.DownloadURL, w, h, nil)
+	log.Printf("processed job %s for content %s", job.JobID, contentID)
+	return nil
+}
+
 func loadConfig() (config, error) {
 	cfg := config{
-		NATSURL:    getenv("NATS_URL", "nats://127.0.0.1:4222"),
-		SubjectIn:  getenv("SUBJECT_IMAGE_UPLOADED", "images.uploaded"),
-		SubjectOut: getenv("SUBJECT_IMAGE_THUMBNAIL_DONE", "images.thumbnail.done"),
-		ThumbDir:   getenv("THUMB_DIR", "./data/thumbs"),
+		NATSURL:       getenv("NATS_URL", "nats://127.0.0.1:4222"),
+		JobSubject:    getenv("PROCESS_SUBJECT", "simple-process.jobs"),
+		WorkerQueue:   getenv("PROCESS_QUEUE", "thumbnail-workers"),
+		ResultSubject: getenv("SUBJECT_IMAGE_THUMBNAIL_DONE", "images.thumbnail.done"),
+		ThumbDir:      getenv("THUMB_DIR", "./data/thumbs"),
 	}
 
 	width, err := parsePositiveInt(getenv("THUMB_WIDTH", "512"), "THUMB_WIDTH")
@@ -184,12 +204,33 @@ func parsePositiveInt(value string, name string) (int, error) {
 	return v, nil
 }
 
-func publishError(nc *bus.Client, subject string, evt schema.ImageUploaded, cause error) {
+func parseHintInt(hints map[string]string, key string) int {
+	if hints == nil {
+		return 0
+	}
+	if val := hints[key]; val != "" {
+		if parsed, err := strconv.Atoi(val); err == nil {
+			return parsed
+		}
+	}
+	return 0
+}
+
+func publishThumbnailEvent(nc *bus.Client, subject, id, sourcePath, thumbRef, uploadURL string, width, height int, cause error) {
 	done := schema.ThumbnailDone{
-		ID: evt.ID, SourcePath: evt.Path, Error: cause.Error(), HappenedAt: time.Now().Unix(),
+		ID:         id,
+		SourcePath: sourcePath,
+		ThumbPath:  thumbRef,
+		UploadURL:  uploadURL,
+		Width:      width,
+		Height:     height,
+		HappenedAt: time.Now().Unix(),
+	}
+	if cause != nil {
+		done.Error = cause.Error()
 	}
 	if err := nc.PublishJSON(subject, done); err != nil {
-		log.Printf("publish error notification failed: %v", err)
+		log.Printf("publish result failed: %v", err)
 	}
 }
 
