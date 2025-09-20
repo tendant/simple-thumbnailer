@@ -6,7 +6,7 @@ package main
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -39,45 +39,56 @@ type config struct {
 func main() {
 	_ = godotenv.Load()
 
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	slog.SetDefault(logger)
+
 	cfg, err := loadConfig()
 	if err != nil {
-		log.Fatal(err)
+		fatal(logger, "load config", err)
 	}
+	logger.Info("worker starting", "nats_url", cfg.NATSURL, "job_subject", cfg.JobSubject, "queue", cfg.WorkerQueue, "result_subject", cfg.ResultSubject, "thumb_dir", cfg.ThumbDir, "default_width", cfg.ThumbWidth, "default_height", cfg.ThumbHeight)
 
 	contentCfg, err := simpleconfig.LoadServerConfig()
 	if err != nil {
-		log.Fatal(err)
+		fatal(logger, "load simplecontent config", err)
 	}
+	logger.Info("loaded simplecontent config", "default_backend", contentCfg.DefaultStorageBackend)
 
 	contentSvc, err := contentCfg.BuildService()
 	if err != nil {
-		log.Fatal(err)
+		fatal(logger, "build simplecontent service", err)
 	}
+	logger.Info("simplecontent service ready", "backend", contentCfg.DefaultStorageBackend)
 
 	uploader := upload.NewClient(contentSvc, contentCfg.DefaultStorageBackend)
 
 	if err := os.MkdirAll(cfg.ThumbDir, 0o755); err != nil {
-		log.Fatal(err)
+		fatal(logger, "ensure thumbnail directory", err, "thumb_dir", cfg.ThumbDir)
 	}
+	logger.Info("ensured thumbnail directory", "thumb_dir", cfg.ThumbDir)
 
 	nc, err := bus.Connect(cfg.NATSURL)
 	if err != nil {
-		log.Fatal(err)
+		fatal(logger, "connect to NATS", err, "nats_url", cfg.NATSURL)
 	}
+	logger.Info("connected to NATS", "nats_url", cfg.NATSURL)
 	defer nc.Close()
 
 	_, err = natsbus.SubscribeWorker(nc.Conn(), cfg.JobSubject, cfg.WorkerQueue, func(jobCtx context.Context, job contracts.Job) error {
-		return handleJob(jobCtx, job, cfg, contentSvc, uploader, nc)
+		return handleJob(jobCtx, job, cfg, contentSvc, uploader, nc, logger)
 	})
 	if err != nil {
-		log.Fatal(err)
+		fatal(logger, "subscribe worker", err, "job_subject", cfg.JobSubject, "queue", cfg.WorkerQueue)
 	}
+	logger.Info("listening for jobs", "subject", cfg.JobSubject, "queue", cfg.WorkerQueue)
 
 	select {}
 }
 
-func handleJob(ctx context.Context, job contracts.Job, cfg config, contentSvc simplecontent.Service, uploader *upload.Client, nc *bus.Client) error {
+func handleJob(ctx context.Context, job contracts.Job, cfg config, contentSvc simplecontent.Service, uploader *upload.Client, nc *bus.Client, logger *slog.Logger) error {
+	jobLogger := logger.With("job_id", job.JobID)
 	sourcePath := job.File.Blob.Location
+	jobLogger.Info("received job", "file_id", job.File.ID, "source", sourcePath)
 
 	contentIDValue := ""
 	if job.File.Attributes != nil {
@@ -92,24 +103,29 @@ func handleJob(ctx context.Context, job contracts.Job, cfg config, contentSvc si
 	}
 	if contentIDValue == "" {
 		err := fmt.Errorf("job %s missing content_id", job.JobID)
+		jobLogger.Warn("missing content identifier")
 		publishThumbnailEvent(nc, cfg.ResultSubject, job.JobID, sourcePath, "", "", 0, 0, err)
 		return err
 	}
 
 	contentID, err := uuid.Parse(contentIDValue)
 	if err != nil {
+		jobLogger.Warn("invalid content identifier", "content_id", contentIDValue, "err", err)
 		publishThumbnailEvent(nc, cfg.ResultSubject, contentIDValue, sourcePath, "", "", 0, 0, err)
 		return fmt.Errorf("parse content id: %w", err)
 	}
+	contentLogger := jobLogger.With("content_id", contentID.String())
 
 	parent, err := contentSvc.GetContent(ctx, contentID)
 	if err != nil {
+		contentLogger.Error("fetch content failed", "err", err)
 		publishThumbnailEvent(nc, cfg.ResultSubject, contentID.String(), sourcePath, "", "", 0, 0, err)
 		return fmt.Errorf("fetch content: %w", err)
 	}
 
 	source, cleanup, err := uploader.FetchSource(ctx, contentID)
 	if err != nil {
+		contentLogger.Error("fetch source failed", "err", err)
 		publishThumbnailEvent(nc, cfg.ResultSubject, contentID.String(), sourcePath, "", "", 0, 0, err)
 		return fmt.Errorf("fetch source: %w", err)
 	}
@@ -123,6 +139,7 @@ func handleJob(ctx context.Context, job contracts.Job, cfg config, contentSvc si
 	if h := parseHintInt(job.Hints, "thumbnail_height"); h > 0 {
 		height = h
 	}
+	contentLogger.Info("using thumbnail dimensions", "width", width, "height", height)
 
 	name := job.File.Name
 	if name == "" && job.File.Attributes != nil {
@@ -139,19 +156,23 @@ func handleJob(ctx context.Context, job contracts.Job, cfg config, contentSvc si
 	if name == "" {
 		name = "thumbnail.png"
 	}
+	contentLogger.Info("resolved thumbnail filename", "name", name)
 
 	thumbPath := buildThumbPath(cfg.ThumbDir, contentID.String(), name)
 	defer os.Remove(thumbPath)
 	if err := os.MkdirAll(filepath.Dir(thumbPath), 0o755); err != nil {
+		contentLogger.Error("ensure thumbnail directory failed", "err", err, "thumb_path", thumbPath)
 		publishThumbnailEvent(nc, cfg.ResultSubject, contentID.String(), sourcePath, "", "", 0, 0, err)
 		return fmt.Errorf("ensure thumb dir: %w", err)
 	}
 
 	w, h, err := img.GenerateThumbnail(source.Path, thumbPath, width, height)
 	if err != nil {
+		contentLogger.Error("thumbnail generation failed", "err", err, "source_path", source.Path, "thumb_path", thumbPath, "requested_width", width, "requested_height", height)
 		publishThumbnailEvent(nc, cfg.ResultSubject, contentID.String(), sourcePath, "", "", width, height, err)
 		return fmt.Errorf("generate thumbnail: %w", err)
 	}
+	contentLogger.Info("thumbnail generated", "thumb_path", thumbPath, "width", w, "height", h)
 
 	result, err := uploader.UploadThumbnail(ctx, parent, thumbPath, upload.UploadOptions{
 		FileName: name,
@@ -160,13 +181,20 @@ func handleJob(ctx context.Context, job contracts.Job, cfg config, contentSvc si
 		Height:   h,
 	})
 	if err != nil {
+		contentLogger.Error("upload thumbnail failed", "err", err)
 		publishThumbnailEvent(nc, cfg.ResultSubject, contentID.String(), sourcePath, "", "", w, h, err)
 		return fmt.Errorf("upload thumbnail: %w", err)
 	}
 
 	publishThumbnailEvent(nc, cfg.ResultSubject, contentID.String(), sourcePath, result.Content.ID.String(), result.DownloadURL, w, h, nil)
-	log.Printf("processed job %s for content %s", job.JobID, contentID)
+	contentLogger.Info("completed job", "object_id", result.ObjectID.String(), "width", w, "height", h, "download_url", result.DownloadURL)
 	return nil
+}
+
+func fatal(logger *slog.Logger, msg string, err error, attrs ...any) {
+	attrs = append(attrs, "err", err)
+	logger.Error(msg, attrs...)
+	os.Exit(1)
 }
 
 func loadConfig() (config, error) {
@@ -230,7 +258,7 @@ func publishThumbnailEvent(nc *bus.Client, subject, id, sourcePath, thumbRef, up
 		done.Error = cause.Error()
 	}
 	if err := nc.PublishJSON(subject, done); err != nil {
-		log.Printf("publish result failed: %v", err)
+		slog.Error("publish result failed", "subject", subject, "id", id, "err", err)
 	}
 }
 
