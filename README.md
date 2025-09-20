@@ -58,3 +58,36 @@ Environment variables control how the worker consumes jobs from NATS:
 
 - `PROCESS_SUBJECT` (default `simple-process.jobs`) — the subject/channel that carries incoming simple-process jobs.
 - `PROCESS_QUEUE` (default `thumbnail-workers`) — the queue group used for load balancing; workers in the same queue share the workload without duplicating messages.
+
+### Simple-content configuration
+
+The worker builds its own `simple-content` client, so it needs the same storage configuration as your content service. Copy the relevant block into `.env`:
+
+Filesystem backend
+
+```bash
+DEFAULT_STORAGE_BACKEND=fs
+FS_BASE_DIR=/srv/simple-content/storage
+FS_URL_PREFIX=http://localhost:8081/files
+DATABASE_TYPE=postgres
+DATABASE_URL=postgres://content_user:content_pass@localhost:5432/simple_content?sslmode=disable
+CONTENT_DB_SCHEMA=content
+```
+
+S3/MinIO backend
+
+```bash
+DEFAULT_STORAGE_BACKEND=s3
+DATABASE_TYPE=postgres
+DATABASE_URL=postgres://content_user:content_pass@localhost:5432/simple_content?sslmode=disable
+CONTENT_DB_SCHEMA=content
+S3_BUCKET=content-bucket
+S3_REGION=us-east-1
+S3_ENDPOINT=http://localhost:9000
+S3_ACCESS_KEY_ID=minio
+S3_SECRET_ACCESS_KEY=minio123
+S3_USE_SSL=false
+S3_USE_PATH_STYLE=true
+```
+
+Adjust credentials, bucket, and endpoints to match your deployment. On startup the worker logs the backend it detected; verify it matches the live simple-content service.
