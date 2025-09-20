@@ -1,16 +1,18 @@
 module github.com/tendant/simple-thumbnailer
 
-go 1.23.0
+go 1.24.2
 
-toolchain go1.23.3
+toolchain go1.24.7
 
 require (
 	github.com/disintegration/imaging v1.6.2
 	github.com/joho/godotenv v1.5.1
 	github.com/nats-io/nats.go v1.45.0
+	github.com/tendant/simple-content v0.1.3
 )
 
 require (
+	github.com/google/uuid v1.6.0 // indirect
 	github.com/klauspost/compress v1.18.0 // indirect
 	github.com/nats-io/nkeys v0.4.11 // indirect
 	github.com/nats-io/nuid v1.0.1 // indirect
