@@ -5,8 +5,7 @@ go 1.24
 require (
 	github.com/disintegration/imaging v1.6.2
 	github.com/joho/godotenv v1.5.1
-	github.com/nats-io/nats.go v1.36.0
-	github.com/tendant/simple-content v0.0.0-00010101000000-000000000000
-	github.com/tendant/simple-process v0.0.0-00010101000000-000000000000
+	github.com/nats-io/nats.go v1.45.0
 )
 
+require github.com/tendant/simple-process v0.0.0-20250919143318-d30e57e6e6f8 // indirect
