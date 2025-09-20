@@ -3,7 +3,7 @@
 A worker that:
 1. Listens for **`images.uploaded`** events (the file already exists in the filesystem).
 2. Generates a thumbnail.
-3. Uploads the thumbnail to the **simple-content** system using its upload client.
+3. Uploads the thumbnail back into **simple-content** as derived content via the Go service library.
 4. Publishes a **`images.thumbnail.done`** event with upload metadata.
 
 Uses:
@@ -11,7 +11,7 @@ Uses:
 - **NATS** as the message bus
 - **`github.com/tendant/simple-process`** for job modeling
 - **`github.com/disintegration/imaging`** for thumbnail generation
-- **`github.com/tendant/simple-content/pkg/simplecontent`** to upload the generated thumbnail
+- **`github.com/tendant/simple-content/pkg/simplecontent`** for content + storage integration
 
 ## Repo layout
 ```

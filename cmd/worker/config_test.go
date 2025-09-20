@@ -3,13 +3,9 @@ package main
 import (
 	"path/filepath"
 	"testing"
-
-	"github.com/tendant/simple-thumbnailer/pkg/schema"
 )
 
 func TestLoadConfigDefaults(t *testing.T) {
-	t.Setenv("CONTENT_UPLOAD_URL", "http://content")
-	t.Setenv("CONTENT_API_KEY", "secret")
 	t.Setenv("THUMB_WIDTH", "")
 	t.Setenv("THUMB_HEIGHT", "")
 
@@ -33,8 +29,6 @@ func TestLoadConfigDefaults(t *testing.T) {
 }
 
 func TestLoadConfigInvalidWidth(t *testing.T) {
-	t.Setenv("CONTENT_UPLOAD_URL", "http://content")
-	t.Setenv("CONTENT_API_KEY", "secret")
 	t.Setenv("THUMB_WIDTH", "not-a-number")
 
 	if _, err := loadConfig(); err == nil {
@@ -42,25 +36,14 @@ func TestLoadConfigInvalidWidth(t *testing.T) {
 	}
 }
 
-func TestLoadConfigMissingUploadSettings(t *testing.T) {
-	t.Setenv("CONTENT_UPLOAD_URL", "")
-	t.Setenv("CONTENT_API_KEY", "")
-
-	if _, err := loadConfig(); err == nil {
-		t.Fatal("expected error when upload configuration is missing")
-	}
-}
-
 func TestBuildThumbPath(t *testing.T) {
-	evt := schema.ImageUploaded{ID: "abc", Path: filepath.Join("/tmp", "photo.jpg")}
-	thumb := buildThumbPath("/data/thumbs", evt)
+	thumb := buildThumbPath("/data/thumbs", "abc", filepath.Join("/tmp", "photo.jpg"))
 	expected := filepath.Join("/data/thumbs", "abc_thumb_photo.jpg")
 	if thumb != expected {
 		t.Fatalf("buildThumbPath mismatch: got %s want %s", thumb, expected)
 	}
 
-	evt.Path = ""
-	thumb = buildThumbPath("/data/thumbs", evt)
+	thumb = buildThumbPath("/data/thumbs", "abc", "")
 	if filepath.Base(thumb) != "abc_thumb_source" {
 		t.Fatalf("expected fallback filename, got %s", thumb)
 	}

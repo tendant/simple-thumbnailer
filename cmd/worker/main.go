@@ -4,7 +4,6 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -12,7 +11,10 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/joho/godotenv"
+
+	simpleconfig "github.com/tendant/simple-content/pkg/simplecontent/config"
 
 	"github.com/tendant/simple-thumbnailer/internal/bus"
 	"github.com/tendant/simple-thumbnailer/internal/img"
@@ -22,14 +24,12 @@ import (
 )
 
 type config struct {
-	NATSURL      string
-	SubjectIn    string
-	SubjectOut   string
-	ThumbDir     string
-	ThumbWidth   int
-	ThumbHeight  int
-	UploadURL    string
-	UploadAPIKey string
+	NATSURL     string
+	SubjectIn   string
+	SubjectOut  string
+	ThumbDir    string
+	ThumbWidth  int
+	ThumbHeight int
 }
 
 func main() {
@@ -40,7 +40,17 @@ func main() {
 		log.Fatal(err)
 	}
 
-	uploader := upload.NewClient(cfg.UploadURL, cfg.UploadAPIKey)
+	contentCfg, err := simpleconfig.LoadServerConfig()
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	contentSvc, err := contentCfg.BuildService()
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	uploader := upload.NewClient(contentSvc, contentCfg.DefaultStorageBackend)
 
 	if err := os.MkdirAll(cfg.ThumbDir, 0o755); err != nil {
 		log.Fatal(err)
@@ -62,25 +72,68 @@ func main() {
 		job := process.NewJob("thumbnail", evt.ID, evt)
 		process.MarkRunning(job)
 
-		thumbPath := buildThumbPath(cfg.ThumbDir, evt)
+		ctx := context.Background()
 
-		w, h, err := img.GenerateThumbnail(evt.Path, thumbPath, cfg.ThumbWidth, cfg.ThumbHeight)
+		contentID, err := uuid.Parse(evt.ID)
+		if err != nil {
+			process.MarkFailed(job, fmt.Errorf("invalid content id: %w", err))
+			publishError(nc, cfg.SubjectOut, evt, err)
+			return
+		}
+
+		parent, err := contentSvc.GetContent(ctx, contentID)
+		if err != nil {
+			process.MarkFailed(job, fmt.Errorf("fetch content: %w", err))
+			publishError(nc, cfg.SubjectOut, evt, err)
+			return
+		}
+
+		source, cleanup, err := uploader.FetchSource(ctx, contentID)
+		if err != nil {
+			process.MarkFailed(job, fmt.Errorf("fetch source: %w", err))
+			publishError(nc, cfg.SubjectOut, evt, err)
+			return
+		}
+		defer cleanup()
+
+		name := evt.Filename
+		if name == "" {
+			name = source.Filename
+		}
+		thumbPath := buildThumbPath(cfg.ThumbDir, evt.ID, name)
+		defer os.Remove(thumbPath)
+		if err := os.MkdirAll(filepath.Dir(thumbPath), 0o755); err != nil {
+			process.MarkFailed(job, fmt.Errorf("ensure thumb dir: %w", err))
+			publishError(nc, cfg.SubjectOut, evt, err)
+			return
+		}
+
+		w, h, err := img.GenerateThumbnail(source.Path, thumbPath, cfg.ThumbWidth, cfg.ThumbHeight)
 		done := schema.ThumbnailDone{
-			ID: evt.ID, SourcePath: evt.Path, ThumbPath: thumbPath,
-			Width: w, Height: h, HappenedAt: time.Now().Unix(),
+			ID:         evt.ID,
+			SourcePath: evt.Path,
+			ThumbPath:  thumbPath,
+			Width:      w,
+			Height:     h,
+			HappenedAt: time.Now().Unix(),
 		}
 
 		if err != nil {
 			process.MarkFailed(job, err)
 			done.Error = err.Error()
 		} else {
-			url, upErr := uploader.UploadThumbnail(thumbPath)
+			result, upErr := uploader.UploadThumbnail(ctx, parent, thumbPath, upload.UploadOptions{
+				FileName: filepath.Base(thumbPath),
+				MimeType: source.MimeType,
+				Width:    w,
+				Height:   h,
+			})
 			if upErr != nil {
 				process.MarkFailed(job, upErr)
 				done.Error = upErr.Error()
 			} else {
 				process.MarkSucceeded(job)
-				done.UploadURL = url
+				done.UploadURL = result.DownloadURL
 			}
 		}
 
@@ -99,12 +152,10 @@ func main() {
 
 func loadConfig() (config, error) {
 	cfg := config{
-		NATSURL:      getenv("NATS_URL", "nats://127.0.0.1:4222"),
-		SubjectIn:    getenv("SUBJECT_IMAGE_UPLOADED", "images.uploaded"),
-		SubjectOut:   getenv("SUBJECT_IMAGE_THUMBNAIL_DONE", "images.thumbnail.done"),
-		ThumbDir:     getenv("THUMB_DIR", "./data/thumbs"),
-		UploadURL:    getenv("CONTENT_UPLOAD_URL", ""),
-		UploadAPIKey: getenv("CONTENT_API_KEY", ""),
+		NATSURL:    getenv("NATS_URL", "nats://127.0.0.1:4222"),
+		SubjectIn:  getenv("SUBJECT_IMAGE_UPLOADED", "images.uploaded"),
+		SubjectOut: getenv("SUBJECT_IMAGE_THUMBNAIL_DONE", "images.thumbnail.done"),
+		ThumbDir:   getenv("THUMB_DIR", "./data/thumbs"),
 	}
 
 	width, err := parsePositiveInt(getenv("THUMB_WIDTH", "512"), "THUMB_WIDTH")
@@ -118,13 +169,6 @@ func loadConfig() (config, error) {
 		return config{}, err
 	}
 	cfg.ThumbHeight = height
-
-	if cfg.UploadURL == "" {
-		return config{}, errors.New("CONTENT_UPLOAD_URL must be set")
-	}
-	if cfg.UploadAPIKey == "" {
-		return config{}, errors.New("CONTENT_API_KEY must be set")
-	}
 
 	return cfg, nil
 }
@@ -140,12 +184,21 @@ func parsePositiveInt(value string, name string) (int, error) {
 	return v, nil
 }
 
-func buildThumbPath(baseDir string, evt schema.ImageUploaded) string {
-	base := filepath.Base(evt.Path)
+func publishError(nc *bus.Client, subject string, evt schema.ImageUploaded, cause error) {
+	done := schema.ThumbnailDone{
+		ID: evt.ID, SourcePath: evt.Path, Error: cause.Error(), HappenedAt: time.Now().Unix(),
+	}
+	if err := nc.PublishJSON(subject, done); err != nil {
+		log.Printf("publish error notification failed: %v", err)
+	}
+}
+
+func buildThumbPath(baseDir, contentID, name string) string {
+	base := filepath.Base(name)
 	if base == "" || base == "." {
 		base = "source"
 	}
-	return filepath.Join(baseDir, evt.ID+"_thumb_"+base)
+	return filepath.Join(baseDir, contentID+"_thumb_"+base)
 }
 
 func getenv(k, d string) string {
