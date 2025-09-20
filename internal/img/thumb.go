@@ -4,6 +4,7 @@ package img
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 
 	"github.com/disintegration/imaging"
 )
@@ -19,7 +20,8 @@ func GenerateThumbnail(srcPath, dstPath string, boxW, boxH int) (w int, h int, _
 
 	thumb := imaging.Fit(src, boxW, boxH, imaging.Lanczos)
 
-	if err := os.MkdirAll(dirOf(dstPath), 0o755); err != nil {
+	dstDir := filepath.Dir(dstPath)
+	if err := os.MkdirAll(dstDir, 0o755); err != nil {
 		return 0, 0, fmt.Errorf("mkdir: %w", err)
 	}
 
@@ -29,13 +31,4 @@ func GenerateThumbnail(srcPath, dstPath string, boxW, boxH int) (w int, h int, _
 
 	b := thumb.Bounds()
 	return b.Dx(), b.Dy(), nil
-}
-
-func dirOf(p string) string {
-	for i := len(p) - 1; i >= 0; i-- {
-		if p[i] == '/' {
-			return p[:i]
-		}
-	}
-	return "."
 }
