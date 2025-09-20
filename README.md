@@ -51,3 +51,10 @@ nats pub simple-process.jobs '{"id":"job-1","type":"simpleprocess.job","datacont
 - Optional `data.file.attributes.filename` – overrides the derived filename; otherwise the worker falls back to the source metadata.
 - Optional hints `thumbnail_width` / `thumbnail_height` inside `data.hints` override the configured dimensions.
 - The worker publishes results on `SUBJECT_IMAGE_THUMBNAIL_DONE` regardless of success or failure; the `error` field is populated on failure.
+
+### Messaging configuration
+
+Environment variables control how the worker consumes jobs from NATS:
+
+- `PROCESS_SUBJECT` (default `simple-process.jobs`) — the subject/channel that carries incoming simple-process jobs.
+- `PROCESS_QUEUE` (default `thumbnail-workers`) — the queue group used for load balancing; workers in the same queue share the workload without duplicating messages.
