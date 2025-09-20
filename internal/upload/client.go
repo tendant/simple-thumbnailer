@@ -8,7 +8,9 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path"
 	"path/filepath"
+	"strings"
 
 	"github.com/google/uuid"
 	simplecontent "github.com/tendant/simple-content/pkg/simplecontent"
@@ -137,10 +139,13 @@ func (c *Client) UploadThumbnail(ctx context.Context, parent *simplecontent.Cont
 		return nil, fmt.Errorf("create derived content: %w", err)
 	}
 
+	objectKey := buildDerivedObjectKey(parent.ID, derived.ID, variant, fileName)
+
 	object, err := c.svc.CreateObject(ctx, simplecontent.CreateObjectRequest{
 		ContentID:          derived.ID,
 		StorageBackendName: c.backend,
 		Version:            1,
+		ObjectKey:          objectKey,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("create object: %w", err)
@@ -216,6 +221,40 @@ func deriveVariant(width, height int) string {
 		return fmt.Sprintf("thumbnail_%d", width)
 	}
 	return fmt.Sprintf("thumbnail_%dx%d", width, height)
+}
+
+func buildDerivedObjectKey(parentID, derivedID uuid.UUID, variant, fileName string) string {
+	cleanName := sanitizeForObjectKey(filepath.Base(fileName))
+	if cleanName == "" {
+		cleanName = derivedID.String()
+	}
+	return path.Join("derived", parentID.String(), derivedID.String(), variant, cleanName)
+}
+
+func sanitizeForObjectKey(name string) string {
+	if name == "" {
+		return ""
+	}
+	trimmed := strings.TrimSpace(name)
+	if trimmed == "" {
+		return ""
+	}
+	sanitized := strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z':
+			return r
+		case r >= 'A' && r <= 'Z':
+			return r
+		case r >= '0' && r <= '9':
+			return r
+		case r == '.' || r == '-' || r == '_':
+			return r
+		default:
+			return '_'
+		}
+	}, trimmed)
+	sanitized = strings.Trim(sanitized, "._")
+	return sanitized
 }
 
 func latestObject(objects []*simplecontent.Object) *simplecontent.Object {

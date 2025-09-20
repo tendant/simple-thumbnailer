@@ -90,3 +90,5 @@ S3_USE_PATH_STYLE=true
 ```
 
 Adjust credentials, bucket, and endpoints to match your deployment. On startup the worker logs the backend it detected; verify it matches the live simple-content service.
+
+Derived thumbnails are written with object keys prefixed by their derivation, e.g. `derived/thumbnail_512/<parent-id>/<derived-id>_<filename>`. This keeps original assets and thumbnails easy to distinguish when browsing a shared bucket.
