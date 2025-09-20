@@ -4,7 +4,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/tendnat/simple-thumbnailer/pkg/schema"
+	"github.com/tendant/simple-thumbnailer/pkg/schema"
 )
 
 func TestLoadConfigDefaults(t *testing.T) {

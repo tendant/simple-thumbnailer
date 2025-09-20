@@ -14,11 +14,11 @@ import (
 
 	"github.com/joho/godotenv"
 
-	"github.com/tendnat/simple-thumbnailer/internal/bus"
-	"github.com/tendnat/simple-thumbnailer/internal/img"
-	"github.com/tendnat/simple-thumbnailer/internal/process"
-	"github.com/tendnat/simple-thumbnailer/internal/upload"
-	"github.com/tendnat/simple-thumbnailer/pkg/schema"
+	"github.com/tendant/simple-thumbnailer/internal/bus"
+	"github.com/tendant/simple-thumbnailer/internal/img"
+	"github.com/tendant/simple-thumbnailer/internal/process"
+	"github.com/tendant/simple-thumbnailer/internal/upload"
+	"github.com/tendant/simple-thumbnailer/pkg/schema"
 )
 
 type config struct {
