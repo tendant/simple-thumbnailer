@@ -68,7 +68,6 @@ Filesystem backend
 ```bash
 DEFAULT_STORAGE_BACKEND=fs
 FS_BASE_DIR=/srv/simple-content/storage
-FS_URL_PREFIX=http://localhost:8081/files
 DATABASE_TYPE=postgres
 DATABASE_URL=postgres://content_user:content_pass@localhost:5432/simple_content?sslmode=disable
 CONTENT_DB_SCHEMA=content
