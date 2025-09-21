@@ -16,6 +16,7 @@ import (
 	"github.com/joho/godotenv"
 
 	simplecontent "github.com/tendant/simple-content/pkg/simplecontent"
+	simpleconfig "github.com/tendant/simple-content/pkg/simplecontent/config"
 	"github.com/tendant/simple-process/pkg/contracts"
 	natsbus "github.com/tendant/simple-process/pkg/transports/nats"
 
