@@ -8,13 +8,18 @@ type ImageUploaded struct {
 	HappenedAt int64  `json:"happened_at"`
 }
 
+type ThumbnailResult struct {
+	Size      string `json:"size"`
+	ThumbPath string `json:"thumb_path,omitempty"`
+	UploadURL string `json:"upload_url,omitempty"`
+	Width     int    `json:"width"`
+	Height    int    `json:"height"`
+}
+
 type ThumbnailDone struct {
-	ID         string `json:"id"`
-	SourcePath string `json:"source_path"`
-	ThumbPath  string `json:"thumb_path,omitempty"`
-	UploadURL  string `json:"upload_url,omitempty"`
-	Error      string `json:"error,omitempty"`
-	Width      int    `json:"width,omitempty"`
-	Height     int    `json:"height,omitempty"`
-	HappenedAt int64  `json:"happened_at"`
+	ID         string            `json:"id"`
+	SourcePath string            `json:"source_path"`
+	Results    []ThumbnailResult `json:"results,omitempty"`
+	Error      string            `json:"error,omitempty"`
+	HappenedAt int64             `json:"happened_at"`
 }

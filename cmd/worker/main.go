@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -26,14 +27,21 @@ import (
 	"github.com/tendant/simple-thumbnailer/pkg/schema"
 )
 
+type SizeConfig struct {
+	Name   string
+	Width  int
+	Height int
+}
+
 type config struct {
-	NATSURL       string
-	JobSubject    string
-	WorkerQueue   string
-	ResultSubject string
-	ThumbDir      string
-	ThumbWidth    int
-	ThumbHeight   int
+	NATSURL        string
+	JobSubject     string
+	WorkerQueue    string
+	ResultSubject  string
+	ThumbDir       string
+	ThumbWidth     int
+	ThumbHeight    int
+	ThumbnailSizes []SizeConfig
 }
 
 func loadSimpleContentConfig() (*simpleconfig.ServerConfig, error) {
@@ -104,6 +112,7 @@ func handleJob(ctx context.Context, job contracts.Job, cfg config, contentSvc si
 	sourcePath := job.File.Blob.Location
 	jobLogger.Info("received job", "file_id", job.File.ID, "source", sourcePath)
 
+	// Parse content ID
 	contentIDValue := ""
 	if job.File.Attributes != nil {
 		if v, ok := job.File.Attributes["content_id"]; ok {
@@ -118,43 +127,43 @@ func handleJob(ctx context.Context, job contracts.Job, cfg config, contentSvc si
 	if contentIDValue == "" {
 		err := fmt.Errorf("job %s missing content_id", job.JobID)
 		jobLogger.Warn("missing content identifier")
-		publishThumbnailEvent(nc, cfg.ResultSubject, job.JobID, sourcePath, "", "", 0, 0, err)
+		publishEventsStep(nc, cfg.ResultSubject, job.JobID, sourcePath, nil, err)
 		return err
 	}
 
 	contentID, err := uuid.Parse(contentIDValue)
 	if err != nil {
 		jobLogger.Warn("invalid content identifier", "content_id", contentIDValue, "err", err)
-		publishThumbnailEvent(nc, cfg.ResultSubject, contentIDValue, sourcePath, "", "", 0, 0, err)
+		publishEventsStep(nc, cfg.ResultSubject, contentIDValue, sourcePath, nil, err)
 		return fmt.Errorf("parse content id: %w", err)
 	}
 	contentLogger := jobLogger.With("content_id", contentID.String())
 
+	// Step 1: Get content metadata
 	parent, err := contentSvc.GetContent(ctx, contentID)
 	if err != nil {
 		contentLogger.Error("fetch content failed", "err", err)
-		publishThumbnailEvent(nc, cfg.ResultSubject, contentID.String(), sourcePath, "", "", 0, 0, err)
+		publishEventsStep(nc, cfg.ResultSubject, contentID.String(), sourcePath, nil, err)
 		return fmt.Errorf("fetch content: %w", err)
 	}
 
-	source, cleanup, err := uploader.FetchSource(ctx, contentID)
+	// Step 2: Fetch source
+	source, err := fetchSourceStep(ctx, contentID, uploader, contentLogger)
 	if err != nil {
-		contentLogger.Error("fetch source failed", "err", err)
-		publishThumbnailEvent(nc, cfg.ResultSubject, contentID.String(), sourcePath, "", "", 0, 0, err)
-		return fmt.Errorf("fetch source: %w", err)
+		publishEventsStep(nc, cfg.ResultSubject, contentID.String(), sourcePath, nil, err)
+		return err
 	}
-	defer cleanup()
+	defer func() {
+		if err := source.Cleanup(); err != nil {
+			contentLogger.Warn("cleanup failed", "err", err)
+		}
+	}()
 
-	width := cfg.ThumbWidth
-	if w := parseHintInt(job.Hints, "thumbnail_width"); w > 0 {
-		width = w
-	}
-	height := cfg.ThumbHeight
-	if h := parseHintInt(job.Hints, "thumbnail_height"); h > 0 {
-		height = h
-	}
-	contentLogger.Info("using thumbnail dimensions", "width", width, "height", height)
+	// Step 3: Determine thumbnail sizes to generate
+	thumbnailSizes := parseThumbnailSizesHint(job.Hints, cfg.ThumbnailSizes)
+	contentLogger.Info("generating thumbnails", "sizes", len(thumbnailSizes))
 
+	// Step 4: Resolve filename
 	name := job.File.Name
 	if name == "" && job.File.Attributes != nil {
 		if v, ok := job.File.Attributes["filename"].(string); ok && v != "" {
@@ -172,36 +181,35 @@ func handleJob(ctx context.Context, job contracts.Job, cfg config, contentSvc si
 	}
 	contentLogger.Info("resolved thumbnail filename", "name", name)
 
-	thumbPath := buildThumbPath(cfg.ThumbDir, contentID.String(), name)
-	defer os.Remove(thumbPath)
-	if err := os.MkdirAll(filepath.Dir(thumbPath), 0o755); err != nil {
-		contentLogger.Error("ensure thumbnail directory failed", "err", err, "thumb_path", thumbPath)
-		publishThumbnailEvent(nc, cfg.ResultSubject, contentID.String(), sourcePath, "", "", 0, 0, err)
-		return fmt.Errorf("ensure thumb dir: %w", err)
+	// Step 5: Generate thumbnails
+	basePath := buildThumbPath(cfg.ThumbDir, contentID.String(), name)
+	specs := make([]img.ThumbnailSpec, len(thumbnailSizes))
+	for i, size := range thumbnailSizes {
+		specs[i] = img.ThumbnailSpec{
+			Name:   size.Name,
+			Width:  size.Width,
+			Height: size.Height,
+		}
 	}
 
-	w, h, err := img.GenerateThumbnail(source.Path, thumbPath, width, height)
+	thumbnails, err := img.GenerateThumbnails(source.Path, basePath, specs)
 	if err != nil {
-		contentLogger.Error("thumbnail generation failed", "err", err, "source_path", source.Path, "thumb_path", thumbPath, "requested_width", width, "requested_height", height)
-		publishThumbnailEvent(nc, cfg.ResultSubject, contentID.String(), sourcePath, "", "", width, height, err)
-		return fmt.Errorf("generate thumbnail: %w", err)
+		contentLogger.Error("thumbnail generation failed", "err", err)
+		publishEventsStep(nc, cfg.ResultSubject, contentID.String(), sourcePath, nil, err)
+		return fmt.Errorf("generate thumbnails: %w", err)
 	}
-	contentLogger.Info("thumbnail generated", "thumb_path", thumbPath, "width", w, "height", h)
+	contentLogger.Info("thumbnails generated", "count", len(thumbnails))
 
-	result, err := uploader.UploadThumbnail(ctx, parent, thumbPath, upload.UploadOptions{
-		FileName: name,
-		MimeType: source.MimeType,
-		Width:    w,
-		Height:   h,
-	})
+	// Step 6: Upload results
+	results, err := uploadResultsStep(ctx, parent, thumbnails, source, uploader, contentLogger)
 	if err != nil {
-		contentLogger.Error("upload thumbnail failed", "err", err)
-		publishThumbnailEvent(nc, cfg.ResultSubject, contentID.String(), sourcePath, "", "", w, h, err)
-		return fmt.Errorf("upload thumbnail: %w", err)
+		publishEventsStep(nc, cfg.ResultSubject, contentID.String(), sourcePath, nil, err)
+		return err
 	}
 
-	publishThumbnailEvent(nc, cfg.ResultSubject, contentID.String(), sourcePath, result.Content.ID.String(), result.DownloadURL, w, h, nil)
-	contentLogger.Info("completed job", "object_id", result.ObjectID.String(), "width", w, "height", h, "download_url", result.DownloadURL)
+	// Step 7: Publish success event
+	publishEventsStep(nc, cfg.ResultSubject, contentID.String(), sourcePath, results, nil)
+	contentLogger.Info("completed job", "thumbnails", len(results))
 	return nil
 }
 
@@ -232,6 +240,22 @@ func loadConfig() (config, error) {
 	}
 	cfg.ThumbHeight = height
 
+	// Load predefined thumbnail sizes
+	cfg.ThumbnailSizes = []SizeConfig{
+		{Name: "small", Width: 150, Height: 150},
+		{Name: "medium", Width: 512, Height: 512},
+		{Name: "large", Width: 1024, Height: 1024},
+	}
+
+	// Override with environment variables if provided
+	if sizesEnv := getenv("THUMBNAIL_SIZES", ""); sizesEnv != "" {
+		sizes, err := parseThumbnailSizes(sizesEnv)
+		if err != nil {
+			return config{}, fmt.Errorf("parse THUMBNAIL_SIZES: %w", err)
+		}
+		cfg.ThumbnailSizes = sizes
+	}
+
 	return cfg, nil
 }
 
@@ -258,14 +282,41 @@ func parseHintInt(hints map[string]string, key string) int {
 	return 0
 }
 
-func publishThumbnailEvent(nc *bus.Client, subject, id, sourcePath, thumbRef, uploadURL string, width, height int, cause error) {
+func parseThumbnailSizesHint(hints map[string]string, availableSizes []SizeConfig) []SizeConfig {
+	if hints == nil {
+		return availableSizes
+	}
+
+	sizesHint := hints["thumbnail_sizes"]
+	if sizesHint == "" {
+		return availableSizes
+	}
+
+	requestedSizes := strings.Split(sizesHint, ",")
+	var selectedSizes []SizeConfig
+
+	for _, requested := range requestedSizes {
+		requested = strings.TrimSpace(requested)
+		for _, available := range availableSizes {
+			if available.Name == requested {
+				selectedSizes = append(selectedSizes, available)
+				break
+			}
+		}
+	}
+
+	if len(selectedSizes) == 0 {
+		return availableSizes
+	}
+
+	return selectedSizes
+}
+
+func publishEventsStep(nc *bus.Client, subject, id, sourcePath string, results []schema.ThumbnailResult, cause error) {
 	done := schema.ThumbnailDone{
 		ID:         id,
 		SourcePath: sourcePath,
-		ThumbPath:  thumbRef,
-		UploadURL:  uploadURL,
-		Width:      width,
-		Height:     height,
+		Results:    results,
 		HappenedAt: time.Now().Unix(),
 	}
 	if cause != nil {
@@ -276,12 +327,99 @@ func publishThumbnailEvent(nc *bus.Client, subject, id, sourcePath, thumbRef, up
 	}
 }
 
+type SourceInfo struct {
+	Path     string
+	Filename string
+	MimeType string
+	Cleanup  func() error
+}
+
+func fetchSourceStep(ctx context.Context, contentID uuid.UUID, uploader *upload.Client, logger *slog.Logger) (*SourceInfo, error) {
+	source, cleanup, err := uploader.FetchSource(ctx, contentID)
+	if err != nil {
+		logger.Error("fetch source failed", "err", err)
+		return nil, fmt.Errorf("fetch source: %w", err)
+	}
+
+	return &SourceInfo{
+		Path:     source.Path,
+		Filename: source.Filename,
+		MimeType: source.MimeType,
+		Cleanup:  cleanup,
+	}, nil
+}
+
+func uploadResultsStep(ctx context.Context, parent *simplecontent.Content, thumbnails []img.ThumbnailOutput, source *SourceInfo, uploader *upload.Client, logger *slog.Logger) ([]schema.ThumbnailResult, error) {
+	var results []schema.ThumbnailResult
+
+	for _, thumb := range thumbnails {
+		result, err := uploader.UploadThumbnail(ctx, parent, thumb.Path, upload.UploadOptions{
+			FileName: source.Filename,
+			MimeType: source.MimeType,
+			Width:    thumb.Width,
+			Height:   thumb.Height,
+		})
+		if err != nil {
+			logger.Error("upload thumbnail failed", "size", thumb.Name, "err", err)
+			return nil, fmt.Errorf("upload %s thumbnail: %w", thumb.Name, err)
+		}
+
+		results = append(results, schema.ThumbnailResult{
+			Size:      thumb.Name,
+			ThumbPath: result.Content.ID.String(),
+			UploadURL: result.DownloadURL,
+			Width:     thumb.Width,
+			Height:    thumb.Height,
+		})
+
+		os.Remove(thumb.Path)
+	}
+
+	return results, nil
+}
+
 func buildThumbPath(baseDir, contentID, name string) string {
 	base := filepath.Base(name)
 	if base == "" || base == "." {
 		base = "source"
 	}
 	return filepath.Join(baseDir, contentID+"_thumb_"+base)
+}
+
+func parseThumbnailSizes(sizesEnv string) ([]SizeConfig, error) {
+	var sizes []SizeConfig
+	pairs := strings.Split(sizesEnv, ",")
+
+	for _, pair := range pairs {
+		parts := strings.Split(strings.TrimSpace(pair), ":")
+		if len(parts) != 2 {
+			return nil, fmt.Errorf("invalid size format '%s', expected 'name:widthxheight'", pair)
+		}
+
+		name := strings.TrimSpace(parts[0])
+		dimParts := strings.Split(parts[1], "x")
+		if len(dimParts) != 2 {
+			return nil, fmt.Errorf("invalid dimensions '%s', expected 'widthxheight'", parts[1])
+		}
+
+		width, err := strconv.Atoi(strings.TrimSpace(dimParts[0]))
+		if err != nil || width <= 0 {
+			return nil, fmt.Errorf("invalid width in '%s'", pair)
+		}
+
+		height, err := strconv.Atoi(strings.TrimSpace(dimParts[1]))
+		if err != nil || height <= 0 {
+			return nil, fmt.Errorf("invalid height in '%s'", pair)
+		}
+
+		sizes = append(sizes, SizeConfig{
+			Name:   name,
+			Width:  width,
+			Height: height,
+		})
+	}
+
+	return sizes, nil
 }
 
 func getenv(k, d string) string {
