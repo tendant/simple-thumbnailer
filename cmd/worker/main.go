@@ -16,7 +16,6 @@ import (
 	"github.com/joho/godotenv"
 
 	simplecontent "github.com/tendant/simple-content/pkg/simplecontent"
-	simpleconfig "github.com/tendant/simple-content/pkg/simplecontent/config"
 	"github.com/tendant/simple-process/pkg/contracts"
 	natsbus "github.com/tendant/simple-process/pkg/transports/nats"
 
@@ -36,6 +35,15 @@ type config struct {
 	ThumbHeight   int
 }
 
+func loadSimpleContentConfig() (*simpleconfig.ServerConfig, error) {
+	cfg, err := simpleconfig.Load(simpleconfig.WithEnv(""))
+	if err != nil {
+		return nil, fmt.Errorf("unable to load simplecontent config: %w", err)
+	}
+
+	return cfg, nil
+}
+
 func main() {
 	_ = godotenv.Load()
 
@@ -48,7 +56,7 @@ func main() {
 	}
 	logger.Info("worker starting", "nats_url", cfg.NATSURL, "job_subject", cfg.JobSubject, "queue", cfg.WorkerQueue, "result_subject", cfg.ResultSubject, "thumb_dir", cfg.ThumbDir, "default_width", cfg.ThumbWidth, "default_height", cfg.ThumbHeight)
 
-	contentCfg, err := simpleconfig.LoadServerConfig()
+	contentCfg, err := loadSimpleContentConfig()
 	if err != nil {
 		fatal(logger, "load simplecontent config", err)
 	}

@@ -70,7 +70,7 @@ DEFAULT_STORAGE_BACKEND=fs
 FS_BASE_DIR=/srv/simple-content/storage
 DATABASE_TYPE=postgres
 DATABASE_URL=postgres://content_user:content_pass@localhost:5432/simple_content?sslmode=disable
-CONTENT_DB_SCHEMA=content
+DATABASE_SCHEMA=content
 ```
 
 S3/MinIO backend
@@ -79,7 +79,7 @@ S3/MinIO backend
 DEFAULT_STORAGE_BACKEND=s3
 DATABASE_TYPE=postgres
 DATABASE_URL=postgres://content_user:content_pass@localhost:5432/simple_content?sslmode=disable
-CONTENT_DB_SCHEMA=content
+DATABASE_SCHEMA=content
 S3_BUCKET=content-bucket
 S3_REGION=us-east-1
 S3_ENDPOINT=http://localhost:9000
