@@ -1,3 +1,6 @@
+# Makefile
+export GOFLAGS ?= -tags=nats
+
 .PHONY: run-worker tidy up down
 
 tidy:
