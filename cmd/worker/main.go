@@ -52,7 +52,12 @@ func main() {
 	if err != nil {
 		fatal(logger, "load simplecontent config", err)
 	}
-	logger.Info("loaded simplecontent config", "default_backend", contentCfg.DefaultStorageBackend)
+	backendSummaries := make([]string, 0, len(contentCfg.StorageBackends))
+	for _, b := range contentCfg.StorageBackends {
+		backendSummaries = append(backendSummaries, fmt.Sprintf("%s(%s)", b.Name, b.Type))
+	}
+	logger.Info("loaded simplecontent config", "default_backend", contentCfg.DefaultStorageBackend, "storage_backends", backendSummaries)
+	logger.Info("simplecontent metadata repository", "database_type", contentCfg.DatabaseType, "schema", contentCfg.DBSchema, "has_database_url", contentCfg.DatabaseURL != "")
 
 	contentSvc, err := contentCfg.BuildService()
 	if err != nil {
