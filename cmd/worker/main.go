@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -107,6 +108,38 @@ func main() {
 	select {}
 }
 
+func classifyError(err error) schema.FailureType {
+	if err == nil {
+		return ""
+	}
+
+	// Check for validation errors
+	var validationErr ValidationError
+	if errors.As(err, &validationErr) {
+		return validationErr.Type
+	}
+
+	// Check for network/temporary errors
+	errStr := err.Error()
+	if strings.Contains(errStr, "connection refused") ||
+		strings.Contains(errStr, "timeout") ||
+		strings.Contains(errStr, "temporary failure") ||
+		strings.Contains(errStr, "context deadline exceeded") {
+		return schema.FailureTypeRetryable
+	}
+
+	// Check for file system errors
+	if strings.Contains(errStr, "no such file") ||
+		strings.Contains(errStr, "permission denied") ||
+		strings.Contains(errStr, "invalid image format") ||
+		strings.Contains(errStr, "unsupported") {
+		return schema.FailureTypePermanent
+	}
+
+	// Default to retryable for unknown errors
+	return schema.FailureTypeRetryable
+}
+
 func handleJob(ctx context.Context, job contracts.Job, cfg config, contentSvc simplecontent.Service, uploader *upload.Client, nc *bus.Client, logger *slog.Logger) error {
 	jobLogger := logger.With("job_id", job.JobID)
 	sourcePath := job.File.Blob.Location
@@ -127,30 +160,62 @@ func handleJob(ctx context.Context, job contracts.Job, cfg config, contentSvc si
 	if contentIDValue == "" {
 		err := fmt.Errorf("job %s missing content_id", job.JobID)
 		jobLogger.Warn("missing content identifier")
-		publishEventsStep(nc, cfg.ResultSubject, job.JobID, sourcePath, nil, err)
+		state := &ProcessingState{JobID: job.JobID}
+		publishEventsStep(nc, cfg.ResultSubject, state, nil, sourcePath, err, schema.FailureTypeValidation)
 		return err
 	}
 
 	contentID, err := uuid.Parse(contentIDValue)
 	if err != nil {
 		jobLogger.Warn("invalid content identifier", "content_id", contentIDValue, "err", err)
-		publishEventsStep(nc, cfg.ResultSubject, contentIDValue, sourcePath, nil, err)
+		state := &ProcessingState{JobID: job.JobID}
+		publishEventsStep(nc, cfg.ResultSubject, state, nil, sourcePath, err, schema.FailureTypeValidation)
 		return fmt.Errorf("parse content id: %w", err)
 	}
 	contentLogger := jobLogger.With("content_id", contentID.String())
 
-	// Step 1: Get content metadata
+	// Initialize processing state
+	thumbnailSizes := parseThumbnailSizesHint(job.Hints, cfg.ThumbnailSizes)
+	sizeNames := make([]string, len(thumbnailSizes))
+	for i, size := range thumbnailSizes {
+		sizeNames[i] = size.Name
+	}
+
+	state := &ProcessingState{
+		JobID:           job.JobID,
+		ParentContentID: contentID.String(),
+		ThumbnailSizes:  sizeNames,
+		StartTime:       time.Now(),
+		Lifecycle:       make([]schema.ThumbnailLifecycleEvent, 0),
+	}
+
+	// Step 1: Get and validate parent content
 	parent, err := contentSvc.GetContent(ctx, contentID)
 	if err != nil {
 		contentLogger.Error("fetch content failed", "err", err)
-		publishEventsStep(nc, cfg.ResultSubject, contentID.String(), sourcePath, nil, err)
+		failureType := classifyError(err)
+		state.AddLifecycleEvent(schema.StageFailed, err, failureType)
+		publishEventsStep(nc, cfg.ResultSubject, state, nil, sourcePath, err, failureType)
 		return fmt.Errorf("fetch content: %w", err)
 	}
 
-	// Step 2: Fetch source
+	state.ParentStatus = parent.Status
+	state.AddLifecycleEvent(schema.StageValidation, nil, "")
+
+	// Step 2: Validate parent content readiness
+	if err := validateParentContentStep(ctx, parent, contentSvc, contentLogger); err != nil {
+		failureType := classifyError(err)
+		state.AddLifecycleEvent(schema.StageFailed, err, failureType)
+		publishEventsStep(nc, cfg.ResultSubject, state, nil, sourcePath, err, failureType)
+		return err
+	}
+
+	// Step 3: Fetch source
 	source, err := fetchSourceStep(ctx, contentID, uploader, contentLogger)
 	if err != nil {
-		publishEventsStep(nc, cfg.ResultSubject, contentID.String(), sourcePath, nil, err)
+		failureType := classifyError(err)
+		state.AddLifecycleEvent(schema.StageFailed, err, failureType)
+		publishEventsStep(nc, cfg.ResultSubject, state, nil, sourcePath, err, failureType)
 		return err
 	}
 	defer func() {
@@ -159,9 +224,8 @@ func handleJob(ctx context.Context, job contracts.Job, cfg config, contentSvc si
 		}
 	}()
 
-	// Step 3: Determine thumbnail sizes to generate
-	thumbnailSizes := parseThumbnailSizesHint(job.Hints, cfg.ThumbnailSizes)
-	contentLogger.Info("generating thumbnails", "sizes", len(thumbnailSizes))
+	state.AddLifecycleEvent(schema.StageProcessing, nil, "")
+	publishLifecycleEvent(nc, cfg.ResultSubject, state.Lifecycle[len(state.Lifecycle)-1])
 
 	// Step 4: Resolve filename
 	name := job.File.Name
@@ -195,21 +259,29 @@ func handleJob(ctx context.Context, job contracts.Job, cfg config, contentSvc si
 	thumbnails, err := img.GenerateThumbnails(source.Path, basePath, specs)
 	if err != nil {
 		contentLogger.Error("thumbnail generation failed", "err", err)
-		publishEventsStep(nc, cfg.ResultSubject, contentID.String(), sourcePath, nil, err)
+		failureType := classifyError(err)
+		state.AddLifecycleEvent(schema.StageFailed, err, failureType)
+		publishEventsStep(nc, cfg.ResultSubject, state, nil, sourcePath, err, failureType)
 		return fmt.Errorf("generate thumbnails: %w", err)
 	}
 	contentLogger.Info("thumbnails generated", "count", len(thumbnails))
 
 	// Step 6: Upload results
-	results, err := uploadResultsStep(ctx, parent, thumbnails, source, uploader, contentLogger)
+	state.AddLifecycleEvent(schema.StageUpload, nil, "")
+	publishLifecycleEvent(nc, cfg.ResultSubject, state.Lifecycle[len(state.Lifecycle)-1])
+
+	results, err := uploadResultsStep(ctx, parent, thumbnails, source, uploader, state, contentLogger)
 	if err != nil {
-		publishEventsStep(nc, cfg.ResultSubject, contentID.String(), sourcePath, nil, err)
+		failureType := classifyError(err)
+		state.AddLifecycleEvent(schema.StageFailed, err, failureType)
+		publishEventsStep(nc, cfg.ResultSubject, state, nil, sourcePath, err, failureType)
 		return err
 	}
 
 	// Step 7: Publish success event
-	publishEventsStep(nc, cfg.ResultSubject, contentID.String(), sourcePath, results, nil)
-	contentLogger.Info("completed job", "thumbnails", len(results))
+	state.AddLifecycleEvent(schema.StageCompleted, nil, "")
+	publishEventsStep(nc, cfg.ResultSubject, state, results, sourcePath, nil, "")
+	contentLogger.Info("completed job", "thumbnails", len(results), "processing_time_ms", state.GetProcessingDuration())
 	return nil
 }
 
@@ -312,18 +384,83 @@ func parseThumbnailSizesHint(hints map[string]string, availableSizes []SizeConfi
 	return selectedSizes
 }
 
-func publishEventsStep(nc *bus.Client, subject, id, sourcePath string, results []schema.ThumbnailResult, cause error) {
-	done := schema.ThumbnailDone{
-		ID:         id,
-		SourcePath: sourcePath,
-		Results:    results,
-		HappenedAt: time.Now().Unix(),
+type ProcessingState struct {
+	JobID           string
+	ParentContentID string
+	ParentStatus    string
+	ThumbnailSizes  []string
+	StartTime       time.Time
+	Lifecycle       []schema.ThumbnailLifecycleEvent
+}
+
+func (ps *ProcessingState) AddLifecycleEvent(stage schema.ProcessingStage, err error, failureType schema.FailureType) {
+	event := schema.ThumbnailLifecycleEvent{
+		JobID:           ps.JobID,
+		ParentContentID: ps.ParentContentID,
+		ParentStatus:    ps.ParentStatus,
+		Stage:           stage,
+		ThumbnailSizes:  ps.ThumbnailSizes,
+		HappenedAt:      time.Now().Unix(),
 	}
+
+	if stage == schema.StageProcessing {
+		event.ProcessingStart = ps.StartTime.UnixMilli()
+	} else if stage == schema.StageCompleted || stage == schema.StageFailed {
+		event.ProcessingStart = ps.StartTime.UnixMilli()
+		event.ProcessingEnd = time.Now().UnixMilli()
+	}
+
+	if err != nil {
+		event.Error = err.Error()
+		event.FailureType = failureType
+	}
+
+	ps.Lifecycle = append(ps.Lifecycle, event)
+}
+
+func (ps *ProcessingState) GetProcessingDuration() int64 {
+	if ps.StartTime.IsZero() {
+		return 0
+	}
+	return time.Since(ps.StartTime).Milliseconds()
+}
+
+func publishLifecycleEvent(nc *bus.Client, subject string, event schema.ThumbnailLifecycleEvent) {
+	if err := nc.PublishJSON(subject+".lifecycle", event); err != nil {
+		slog.Error("publish lifecycle event failed", "subject", subject, "stage", event.Stage, "err", err)
+	}
+}
+
+func publishEventsStep(nc *bus.Client, subject string, state *ProcessingState, results []schema.ThumbnailResult, sourcePath string, cause error, failureType schema.FailureType) {
+	totalProcessed := len(results)
+	totalFailed := 0
+
+	for _, result := range results {
+		if result.Status != "uploaded" {
+			totalFailed++
+		}
+	}
+
+	done := schema.ThumbnailDone{
+		ID:               state.JobID,
+		SourcePath:       sourcePath,
+		ParentContentID:  state.ParentContentID,
+		ParentStatus:     state.ParentStatus,
+		TotalProcessed:   totalProcessed,
+		TotalFailed:      totalFailed,
+		ProcessingTimeMs: state.GetProcessingDuration(),
+		Results:          results,
+		Lifecycle:        state.Lifecycle,
+		HappenedAt:       time.Now().Unix(),
+	}
+
 	if cause != nil {
 		done.Error = cause.Error()
+		done.FailureType = failureType
 	}
+
 	if err := nc.PublishJSON(subject, done); err != nil {
-		slog.Error("publish result failed", "subject", subject, "id", id, "err", err)
+		slog.Error("publish result failed", "subject", subject, "id", state.JobID, "err", err)
 	}
 }
 
@@ -332,6 +469,55 @@ type SourceInfo struct {
 	Filename string
 	MimeType string
 	Cleanup  func() error
+}
+
+type ValidationError struct {
+	Type    schema.FailureType
+	Message string
+}
+
+func (e ValidationError) Error() string {
+	return e.Message
+}
+
+func validateParentContentStep(ctx context.Context, parent *simplecontent.Content, contentSvc simplecontent.Service, logger *slog.Logger) error {
+	// Check parent content status
+	if parent.Status != string(simplecontent.ContentStatusUploaded) {
+		logger.Warn("parent content not ready for derivation", "status", parent.Status, "required", "uploaded")
+		return ValidationError{
+			Type:    schema.FailureTypeValidation,
+			Message: fmt.Sprintf("parent content status is '%s', expected 'uploaded'", parent.Status),
+		}
+	}
+
+	// Verify parent has uploaded objects
+	objects, err := contentSvc.GetObjectsByContentID(ctx, parent.ID)
+	if err != nil {
+		logger.Error("failed to fetch parent objects", "err", err)
+		return ValidationError{
+			Type:    schema.FailureTypeRetryable,
+			Message: fmt.Sprintf("failed to validate parent objects: %v", err),
+		}
+	}
+
+	hasUploadedObject := false
+	for _, obj := range objects {
+		if obj.Status == string(simplecontent.ObjectStatusUploaded) {
+			hasUploadedObject = true
+			break
+		}
+	}
+
+	if !hasUploadedObject {
+		logger.Warn("parent content has no uploaded objects")
+		return ValidationError{
+			Type:    schema.FailureTypeValidation,
+			Message: "parent content has no uploaded objects available for processing",
+		}
+	}
+
+	logger.Info("parent content validation passed", "content_id", parent.ID, "objects", len(objects))
+	return nil
 }
 
 func fetchSourceStep(ctx context.Context, contentID uuid.UUID, uploader *upload.Client, logger *slog.Logger) (*SourceInfo, error) {
@@ -349,29 +535,65 @@ func fetchSourceStep(ctx context.Context, contentID uuid.UUID, uploader *upload.
 	}, nil
 }
 
-func uploadResultsStep(ctx context.Context, parent *simplecontent.Content, thumbnails []img.ThumbnailOutput, source *SourceInfo, uploader *upload.Client, logger *slog.Logger) ([]schema.ThumbnailResult, error) {
+func uploadResultsStep(ctx context.Context, parent *simplecontent.Content, thumbnails []img.ThumbnailOutput, source *SourceInfo, uploader *upload.Client, state *ProcessingState, logger *slog.Logger) ([]schema.ThumbnailResult, error) {
 	var results []schema.ThumbnailResult
 
 	for _, thumb := range thumbnails {
+		processingStart := time.Now()
+
 		result, err := uploader.UploadThumbnail(ctx, parent, thumb.Path, upload.UploadOptions{
 			FileName: source.Filename,
 			MimeType: source.MimeType,
 			Width:    thumb.Width,
 			Height:   thumb.Height,
 		})
+
+		processingTime := time.Since(processingStart).Milliseconds()
+
 		if err != nil {
 			logger.Error("upload thumbnail failed", "size", thumb.Name, "err", err)
-			return nil, fmt.Errorf("upload %s thumbnail: %w", thumb.Name, err)
+
+			// Add failed result
+			results = append(results, schema.ThumbnailResult{
+				Size:    thumb.Name,
+				Width:   thumb.Width,
+				Height:  thumb.Height,
+				Status:  "failed",
+				DerivationParams: &schema.DerivationParams{
+					SourceWidth:    thumb.SourceWidth,
+					SourceHeight:   thumb.SourceHeight,
+					TargetWidth:    thumb.Width,
+					TargetHeight:   thumb.Height,
+					Algorithm:      "lanczos",
+					ProcessingTime: processingTime,
+					GeneratedAt:    time.Now().Unix(),
+				},
+			})
+			continue
+		}
+
+		derivationParams := &schema.DerivationParams{
+			SourceWidth:    thumb.SourceWidth,
+			SourceHeight:   thumb.SourceHeight,
+			TargetWidth:    thumb.Width,
+			TargetHeight:   thumb.Height,
+			Algorithm:      "lanczos",
+			ProcessingTime: processingTime,
+			GeneratedAt:    time.Now().Unix(),
 		}
 
 		results = append(results, schema.ThumbnailResult{
-			Size:      thumb.Name,
-			ThumbPath: result.Content.ID.String(),
-			UploadURL: result.DownloadURL,
-			Width:     thumb.Width,
-			Height:    thumb.Height,
+			Size:             thumb.Name,
+			ContentID:        result.Content.ID.String(),
+			ObjectID:         result.ObjectID.String(),
+			UploadURL:        result.DownloadURL,
+			Width:            thumb.Width,
+			Height:           thumb.Height,
+			Status:           "uploaded",
+			DerivationParams: derivationParams,
 		})
 
+		logger.Info("thumbnail uploaded successfully", "size", thumb.Name, "content_id", result.Content.ID, "processing_time_ms", processingTime)
 		os.Remove(thumb.Path)
 	}
 

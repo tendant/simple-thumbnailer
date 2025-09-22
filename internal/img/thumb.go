@@ -16,10 +16,12 @@ type ThumbnailSpec struct {
 }
 
 type ThumbnailOutput struct {
-	Name   string
-	Path   string
-	Width  int
-	Height int
+	Name         string
+	Path         string
+	Width        int
+	Height       int
+	SourceWidth  int
+	SourceHeight int
 }
 
 // GenerateThumbnail loads an image from srcPath, creates a thumbnail with the
@@ -53,6 +55,11 @@ func GenerateThumbnails(srcPath, baseDstPath string, specs []ThumbnailSpec) ([]T
 		return nil, fmt.Errorf("open: %w", err)
 	}
 
+	// Get source dimensions
+	srcBounds := src.Bounds()
+	sourceWidth := srcBounds.Dx()
+	sourceHeight := srcBounds.Dy()
+
 	var results []ThumbnailOutput
 
 	for _, spec := range specs {
@@ -72,10 +79,12 @@ func GenerateThumbnails(srcPath, baseDstPath string, specs []ThumbnailSpec) ([]T
 
 		b := thumb.Bounds()
 		results = append(results, ThumbnailOutput{
-			Name:   spec.Name,
-			Path:   dstPath,
-			Width:  b.Dx(),
-			Height: b.Dy(),
+			Name:         spec.Name,
+			Path:         dstPath,
+			Width:        b.Dx(),
+			Height:       b.Dy(),
+			SourceWidth:  sourceWidth,
+			SourceHeight: sourceHeight,
 		})
 	}
 
