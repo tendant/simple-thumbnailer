@@ -126,6 +126,7 @@ func (c *Client) UploadThumbnail(ctx context.Context, parent *simplecontent.Cont
 	}
 
 	variant := deriveVariant(opts.Width, opts.Height)
+	sizeVariant := deriveSizeVariant(opts.Width, opts.Height)
 
 	derived, err := c.svc.CreateDerivedContent(ctx, simplecontent.CreateDerivedContentRequest{
 		ParentID:       parent.ID,
@@ -139,7 +140,7 @@ func (c *Client) UploadThumbnail(ctx context.Context, parent *simplecontent.Cont
 		return nil, fmt.Errorf("create derived content: %w", err)
 	}
 
-	objectKey := buildDerivedObjectKey(parent.ID, derived.ID, variant, fileName)
+	objectKey := buildDerivedObjectKey(parent.ID, derived.ID, sizeVariant, fileName)
 
 	object, err := c.svc.CreateObject(ctx, simplecontent.CreateObjectRequest{
 		ContentID:          derived.ID,
@@ -217,6 +218,10 @@ func detectMime(path string) (string, error) {
 }
 
 func deriveVariant(width, height int) string {
+	return "thumbnail"
+}
+
+func deriveSizeVariant(width, height int) string {
 	if width == height {
 		return fmt.Sprintf("thumbnail_%d", width)
 	}
