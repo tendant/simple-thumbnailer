@@ -1,15 +1,16 @@
-# Content Lifecycle Enhancement
+# Simple Content API Integration
 
-This document describes the enhanced content lifecycle implementation that aligns with the structured content management approach.
+This document describes the simplified content lifecycle using the latest simple-content API (v0.1.11) with unified content operations.
 
-## Enhanced Features
+## Simplified Architecture
 
-### 1. Content Status Validation
-- Validates parent content is in `uploaded` status before processing
-- Ensures parent has at least one `uploaded` object for stable processing
+### 1. Content-Only Operations
+- Uses unified `UploadDerivedContent()` API - no object-level operations
+- Validates parent content status only - content service handles data integrity
+- Direct content download via `DownloadContent()` - no object queries
 - Early failure with appropriate error classification
 
-### 2. Comprehensive Lifecycle Events
+### 2. Streamlined Lifecycle Events
 ```json
 {
   "job_id": "job-123",
@@ -85,7 +86,6 @@ THUMB_HEIGHT=512
     {
       "size": "small",
       "content_id": "derived-789",
-      "object_id": "object-101",
       "upload_url": "https://...",
       "width": 150,
       "height": 150,
@@ -132,17 +132,31 @@ THUMB_HEIGHT=512
 
 ## Benefits
 
-1. **Audit Trail**: Complete lifecycle tracking for compliance and debugging
-2. **Error Recovery**: Intelligent failure classification for retry strategies
-3. **Performance Monitoring**: Processing time tracking and optimization insights
-4. **Content Integrity**: Parent content validation ensures stable inputs
-5. **Reproducible Processing**: Stored derivation parameters enable re-generation
+1. **Simplified Operations**: Single API calls replace multi-step object workflows
+2. **Better Abstractions**: Content service handles storage complexity internally
+3. **Reduced Complexity**: No object tracking or state management needed
+4. **Future-Proof**: Aligned with latest simple-content API patterns
+5. **Better Performance**: Fewer database operations and API calls
 
-## Migration Notes
+## API Improvements
 
-- No backward compatibility maintained as requested
-- Enhanced event schema provides richer information
-- Processing state management enables better monitoring
-- Error classification improves operational reliability
+### Before (Object-Based)
+```go
+// Multi-step complex workflow
+CreateDerivedContent() → CreateObject() → UploadObjectWithMetadata() →
+UpdateObjectMetaFromStorage() → SetContentMetadata() → UpdateContent()
 
-This implementation maintains the simple NATS-based architecture while adding robust content lifecycle management aligned with enterprise content management practices.
+// Object validation
+objects, err := svc.GetObjectsByContentID(ctx, parentID)
+```
+
+### After (Content-Based)
+```go
+// Single unified operation
+derived, err := svc.UploadDerivedContent(ctx, UploadDerivedContentRequest{...})
+
+// Simple content validation
+if parent.Status != "uploaded" { return ValidationError{...} }
+```
+
+This implementation leverages the latest simple-content API (v0.1.11) for maximum simplicity and maintainability.
