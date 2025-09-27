@@ -3,7 +3,6 @@ package upload
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -42,20 +41,12 @@ type UploadResult struct {
 	DownloadURL string
 }
 
-// FetchSource downloads the latest object for the given content ID into a temporary file.
+// FetchSource downloads the latest content into a temporary file using the simplified API.
 func (c *Client) FetchSource(ctx context.Context, contentID uuid.UUID) (*Source, func() error, error) {
-	objects, err := c.svc.GetObjectsByContentID(ctx, contentID)
+	// Use the new simplified DownloadContent method
+	reader, err := c.svc.DownloadContent(ctx, contentID)
 	if err != nil {
-		return nil, nil, fmt.Errorf("list objects: %w", err)
-	}
-	object := latestObject(objects)
-	if object == nil {
-		return nil, nil, errors.New("content has no objects")
-	}
-
-	reader, err := c.svc.DownloadObject(ctx, object.ID)
-	if err != nil {
-		return nil, nil, fmt.Errorf("download object: %w", err)
+		return nil, nil, fmt.Errorf("download content: %w", err)
 	}
 	defer reader.Close()
 
@@ -66,29 +57,28 @@ func (c *Client) FetchSource(ctx context.Context, contentID uuid.UUID) (*Source,
 	if _, err := io.Copy(temp, reader); err != nil {
 		temp.Close()
 		os.Remove(temp.Name())
-		return nil, nil, fmt.Errorf("copy object to disk: %w", err)
+		return nil, nil, fmt.Errorf("copy content to disk: %w", err)
 	}
 	if err := temp.Close(); err != nil {
 		os.Remove(temp.Name())
 		return nil, nil, fmt.Errorf("close temp file: %w", err)
 	}
 
-	filename := filepath.Base(object.ObjectKey)
+	// Get content metadata using the simplified API
+	filename := "downloaded"
 	mimeType := ""
-	if meta, err := c.svc.GetObjectMetadata(ctx, object.ID); err == nil {
-		if name, ok := meta["file_name"].(string); ok && name != "" {
-			filename = name
+	if meta, err := c.svc.GetContentMetadata(ctx, contentID); err == nil {
+		if meta.FileName != "" {
+			filename = meta.FileName
 		}
-		if mt, ok := meta["mime_type"].(string); ok {
-			mimeType = mt
-		}
+		mimeType = meta.MimeType
 	}
 
 	cleanup := func() error {
 		return os.Remove(temp.Name())
 	}
 
-	return &Source{Path: temp.Name(), Filename: filename, MimeType: mimeType, ObjectID: object.ID}, cleanup, nil
+	return &Source{Path: temp.Name(), Filename: filename, MimeType: mimeType, ObjectID: uuid.Nil}, cleanup, nil
 }
 
 // UploadOptions customises thumbnail persistence.
@@ -99,7 +89,7 @@ type UploadOptions struct {
 	Height   int
 }
 
-// UploadThumbnail creates a derived content + object and uploads the thumbnail asset.
+// UploadThumbnail creates and uploads a thumbnail using the simplified UploadDerivedContent API.
 func (c *Client) UploadThumbnail(ctx context.Context, parent *simplecontent.Content, thumbPath string, opts UploadOptions) (*UploadResult, error) {
 	info, err := os.Stat(thumbPath)
 	if err != nil {
@@ -120,86 +110,59 @@ func (c *Client) UploadThumbnail(ctx context.Context, parent *simplecontent.Cont
 		mimeType = mt
 	}
 
-	metadata := map[string]interface{}{
-		"width":  opts.Width,
-		"height": opts.Height,
-	}
-
-	variant := deriveVariant(opts.Width, opts.Height)
-	sizeVariant := deriveSizeVariant(opts.Width, opts.Height)
-
-	derived, err := c.svc.CreateDerivedContent(ctx, simplecontent.CreateDerivedContentRequest{
-		ParentID:       parent.ID,
-		OwnerID:        parent.OwnerID,
-		TenantID:       parent.TenantID,
-		DerivationType: "thumbnail",
-		Variant:        variant,
-		Metadata:       metadata,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("create derived content: %w", err)
-	}
-
-	objectKey := buildDerivedObjectKey(parent.ID, derived.ID, sizeVariant, fileName)
-
-	object, err := c.svc.CreateObject(ctx, simplecontent.CreateObjectRequest{
-		ContentID:          derived.ID,
-		StorageBackendName: c.backend,
-		Version:            1,
-		ObjectKey:          objectKey,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("create object: %w", err)
-	}
-
 	file, err := os.Open(thumbPath)
 	if err != nil {
 		return nil, fmt.Errorf("open thumbnail: %w", err)
 	}
 	defer file.Close()
 
-	if _, err := file.Seek(0, 0); err != nil {
-		return nil, fmt.Errorf("seek thumbnail: %w", err)
+	// Use the new simplified UploadDerivedContent method
+	variant := deriveSizeVariant(opts.Width, opts.Height)
+	metadata := map[string]interface{}{
+		"width":  opts.Width,
+		"height": opts.Height,
 	}
 
-	if err := c.svc.UploadObjectWithMetadata(ctx, file, simplecontent.UploadObjectWithMetadataRequest{
-		ObjectID: object.ID,
-		MimeType: mimeType,
-	}); err != nil {
-		return nil, fmt.Errorf("upload thumbnail: %w", err)
+	derived, err := c.svc.UploadDerivedContent(ctx, simplecontent.UploadDerivedContentRequest{
+		ParentID:           parent.ID,
+		OwnerID:            parent.OwnerID,
+		TenantID:           parent.TenantID,
+		DerivationType:     "thumbnail",
+		Variant:            variant,
+		StorageBackendName: c.backend,
+		Reader:             file,
+		FileName:           fileName,
+		FileSize:           info.Size(),
+		Tags:               []string{"thumbnail"},
+		Metadata:           metadata,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("upload derived content: %w", err)
 	}
 
-	if _, err := c.svc.UpdateObjectMetaFromStorage(ctx, object.ID); err != nil {
-		return nil, fmt.Errorf("refresh object metadata: %w", err)
+	// Using the new content service approach - no need to access objects directly
+	// For backward compatibility, we'll use uuid.Nil for ObjectID
+	return &UploadResult{Content: derived, ObjectID: uuid.Nil, DownloadURL: ""}, nil
+
+	// Legacy object access code (commented out)
+	/*
+	objects, err := c.svc.GetObjectsByContentID(ctx, derived.ID)
+	if err != nil {
+		return nil, fmt.Errorf("get objects: %w", err)
+	}
+	object := latestObject(objects)
+	if object == nil {
+		return nil, errors.New("no objects found for uploaded content")
 	}
 
-	if err := c.svc.SetContentMetadata(ctx, simplecontent.SetContentMetadataRequest{
-		ContentID:      derived.ID,
-		ContentType:    mimeType,
-		Title:          fileName,
-		Description:    fmt.Sprintf("Thumbnail %dx%d", opts.Width, opts.Height),
-		Tags:           []string{"thumbnail"},
-		FileName:       fileName,
-		FileSize:       info.Size(),
-		CustomMetadata: metadata,
-	}); err != nil {
-		return nil, fmt.Errorf("set content metadata: %w", err)
-	}
-
-	derived.Name = fileName
-	derived.Status = string(simplecontent.ContentStatusUploaded)
-	derived.OwnerType = parent.OwnerType
-	derived.DocumentType = parent.DocumentType
-	if err := c.svc.UpdateContent(ctx, simplecontent.UpdateContentRequest{Content: derived}); err != nil {
-		return nil, fmt.Errorf("update derived content status: %w", err)
-	}
-
+	// Get download URL for the result
 	downloadURL, err := c.svc.GetDownloadURL(ctx, object.ID)
 	if err != nil {
 		downloadURL = ""
 	}
 
 	return &UploadResult{Content: derived, ObjectID: object.ID, DownloadURL: downloadURL}, nil
+	*/
 }
 
 func detectMime(path string) (string, error) {

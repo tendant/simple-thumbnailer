@@ -490,33 +490,9 @@ func validateParentContentStep(ctx context.Context, parent *simplecontent.Conten
 		}
 	}
 
-	// Verify parent has uploaded objects
-	objects, err := contentSvc.GetObjectsByContentID(ctx, parent.ID)
-	if err != nil {
-		logger.Error("failed to fetch parent objects", "err", err)
-		return ValidationError{
-			Type:    schema.FailureTypeRetryable,
-			Message: fmt.Sprintf("failed to validate parent objects: %v", err),
-		}
-	}
-
-	hasUploadedObject := false
-	for _, obj := range objects {
-		if obj.Status == string(simplecontent.ObjectStatusUploaded) {
-			hasUploadedObject = true
-			break
-		}
-	}
-
-	if !hasUploadedObject {
-		logger.Warn("parent content has no uploaded objects")
-		return ValidationError{
-			Type:    schema.FailureTypeValidation,
-			Message: "parent content has no uploaded objects available for processing",
-		}
-	}
-
-	logger.Info("parent content validation passed", "content_id", parent.ID, "objects", len(objects))
+	// With the new content service, we can trust that uploaded status means content is ready
+	// No need to check individual objects anymore
+	logger.Info("parent content validation passed", "content_id", parent.ID, "status", parent.Status)
 	return nil
 }
 
