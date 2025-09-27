@@ -60,7 +60,7 @@ func main() {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	slog.SetDefault(logger)
 
-	cfg, err := loadConfig()
+	cfg, err := LoadConfig()
 	if err != nil {
 		fatal(logger, "load config", err)
 	}
@@ -246,7 +246,7 @@ func handleJob(ctx context.Context, job contracts.Job, cfg config, contentSvc si
 	contentLogger.Info("resolved thumbnail filename", "name", name)
 
 	// Step 5: Generate thumbnails
-	basePath := buildThumbPath(cfg.ThumbDir, contentID.String(), name)
+	basePath := BuildThumbPath(cfg.ThumbDir, contentID.String(), name)
 	specs := make([]img.ThumbnailSpec, len(thumbnailSizes))
 	for i, size := range thumbnailSizes {
 		specs[i] = img.ThumbnailSpec{
@@ -291,7 +291,7 @@ func fatal(logger *slog.Logger, msg string, err error, attrs ...any) {
 	os.Exit(1)
 }
 
-func loadConfig() (config, error) {
+func LoadConfig() (config, error) {
 	cfg := config{
 		NATSURL:       getenv("NATS_URL", "nats://127.0.0.1:4222"),
 		JobSubject:    getenv("PROCESS_SUBJECT", "simple-process.jobs"),
@@ -576,7 +576,7 @@ func uploadResultsStep(ctx context.Context, parent *simplecontent.Content, thumb
 	return results, nil
 }
 
-func buildThumbPath(baseDir, contentID, name string) string {
+func BuildThumbPath(baseDir, contentID, name string) string {
 	base := filepath.Base(name)
 	if base == "" || base == "." {
 		base = "source"

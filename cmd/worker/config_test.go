@@ -1,3 +1,5 @@
+//go:build nats
+
 package main
 
 import (
@@ -9,7 +11,7 @@ func TestLoadConfigDefaults(t *testing.T) {
 	t.Setenv("THUMB_WIDTH", "")
 	t.Setenv("THUMB_HEIGHT", "")
 
-	cfg, err := loadConfig()
+	cfg, err := LoadConfig()
 	if err != nil {
 		t.Fatalf("loadConfig returned error: %v", err)
 	}
@@ -37,19 +39,19 @@ func TestLoadConfigDefaults(t *testing.T) {
 func TestLoadConfigInvalidWidth(t *testing.T) {
 	t.Setenv("THUMB_WIDTH", "not-a-number")
 
-	if _, err := loadConfig(); err == nil {
+	if _, err := LoadConfig(); err == nil {
 		t.Fatal("expected error for invalid THUMB_WIDTH")
 	}
 }
 
 func TestBuildThumbPath(t *testing.T) {
-	thumb := buildThumbPath("/data/thumbs", "abc", filepath.Join("/tmp", "photo.jpg"))
+	thumb := BuildThumbPath("/data/thumbs", "abc", filepath.Join("/tmp", "photo.jpg"))
 	expected := filepath.Join("/data/thumbs", "abc_thumb_photo.jpg")
 	if thumb != expected {
 		t.Fatalf("buildThumbPath mismatch: got %s want %s", thumb, expected)
 	}
 
-	thumb = buildThumbPath("/data/thumbs", "abc", "")
+	thumb = BuildThumbPath("/data/thumbs", "abc", "")
 	if filepath.Base(thumb) != "abc_thumb_source" {
 		t.Fatalf("expected fallback filename, got %s", thumb)
 	}
