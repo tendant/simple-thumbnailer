@@ -7,9 +7,7 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"path"
 	"path/filepath"
-	"strings"
 
 	"github.com/google/uuid"
 	simplecontent "github.com/tendant/simple-content/pkg/simplecontent"
@@ -26,19 +24,16 @@ func NewClient(svc simplecontent.Service, defaultBackend string) *Client {
 	return &Client{svc: svc, backend: defaultBackend}
 }
 
-// Source represents a downloaded original object stored temporarily on disk.
+// Source represents a downloaded original content stored temporarily on disk.
 type Source struct {
 	Path     string
 	Filename string
 	MimeType string
-	ObjectID uuid.UUID
 }
 
 // UploadResult captures information about a stored thumbnail.
 type UploadResult struct {
-	Content     *simplecontent.Content
-	ObjectID    uuid.UUID
-	DownloadURL string
+	Content *simplecontent.Content
 }
 
 // FetchSource downloads the latest content into a temporary file using the simplified API.
@@ -78,7 +73,7 @@ func (c *Client) FetchSource(ctx context.Context, contentID uuid.UUID) (*Source,
 		return os.Remove(temp.Name())
 	}
 
-	return &Source{Path: temp.Name(), Filename: filename, MimeType: mimeType, ObjectID: uuid.Nil}, cleanup, nil
+	return &Source{Path: temp.Name(), Filename: filename, MimeType: mimeType}, cleanup, nil
 }
 
 // UploadOptions customises thumbnail persistence.
@@ -140,29 +135,7 @@ func (c *Client) UploadThumbnail(ctx context.Context, parent *simplecontent.Cont
 		return nil, fmt.Errorf("upload derived content: %w", err)
 	}
 
-	// Using the new content service approach - no need to access objects directly
-	// For backward compatibility, we'll use uuid.Nil for ObjectID
-	return &UploadResult{Content: derived, ObjectID: uuid.Nil, DownloadURL: ""}, nil
-
-	// Legacy object access code (commented out)
-	/*
-	objects, err := c.svc.GetObjectsByContentID(ctx, derived.ID)
-	if err != nil {
-		return nil, fmt.Errorf("get objects: %w", err)
-	}
-	object := latestObject(objects)
-	if object == nil {
-		return nil, errors.New("no objects found for uploaded content")
-	}
-
-	// Get download URL for the result
-	downloadURL, err := c.svc.GetDownloadURL(ctx, object.ID)
-	if err != nil {
-		downloadURL = ""
-	}
-
-	return &UploadResult{Content: derived, ObjectID: object.ID, DownloadURL: downloadURL}, nil
-	*/
+	return &UploadResult{Content: derived}, nil
 }
 
 func detectMime(path string) (string, error) {
@@ -180,8 +153,19 @@ func detectMime(path string) (string, error) {
 	return http.DetectContentType(buf[:n]), nil
 }
 
-func deriveVariant(width, height int) string {
-	return "thumbnail"
+// GetThumbnailsBySize retrieves thumbnails of specific sizes for a parent content using the new API.
+func (c *Client) GetThumbnailsBySize(ctx context.Context, parentID uuid.UUID, sizes []string) ([]*simplecontent.DerivedContent, error) {
+	variants := make([]string, len(sizes))
+	for i, size := range sizes {
+		variants[i] = fmt.Sprintf("thumbnail_%s", size)
+	}
+
+	return c.svc.ListDerivedContent(ctx,
+		simplecontent.WithParentID(parentID),
+		simplecontent.WithDerivationType("thumbnail"),
+		simplecontent.WithVariants(variants...),
+		simplecontent.WithURLs(),
+	)
 }
 
 func deriveSizeVariant(width, height int) string {
@@ -189,48 +173,4 @@ func deriveSizeVariant(width, height int) string {
 		return fmt.Sprintf("thumbnail_%d", width)
 	}
 	return fmt.Sprintf("thumbnail_%dx%d", width, height)
-}
-
-func buildDerivedObjectKey(parentID, derivedID uuid.UUID, variant, fileName string) string {
-	cleanName := sanitizeForObjectKey(filepath.Base(fileName))
-	if cleanName == "" {
-		cleanName = derivedID.String()
-	}
-	return path.Join("derived", parentID.String(), derivedID.String(), variant, cleanName)
-}
-
-func sanitizeForObjectKey(name string) string {
-	if name == "" {
-		return ""
-	}
-	trimmed := strings.TrimSpace(name)
-	if trimmed == "" {
-		return ""
-	}
-	sanitized := strings.Map(func(r rune) rune {
-		switch {
-		case r >= 'a' && r <= 'z':
-			return r
-		case r >= 'A' && r <= 'Z':
-			return r
-		case r >= '0' && r <= '9':
-			return r
-		case r == '.' || r == '-' || r == '_':
-			return r
-		default:
-			return '_'
-		}
-	}, trimmed)
-	sanitized = strings.Trim(sanitized, "._")
-	return sanitized
-}
-
-func latestObject(objects []*simplecontent.Object) *simplecontent.Object {
-	var latest *simplecontent.Object
-	for _, obj := range objects {
-		if latest == nil || obj.Version > latest.Version {
-			latest = obj
-		}
-	}
-	return latest
 }

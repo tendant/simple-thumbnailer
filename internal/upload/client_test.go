@@ -151,3 +151,39 @@ func TestUploadThumbnailWorkflow(t *testing.T) {
 		t.Fatalf("unexpected width metadata type %T", v)
 	}
 }
+
+func TestGetThumbnailsBySize(t *testing.T) {
+	env := newTestEnv(t)
+	ctx := context.Background()
+
+	// First upload a thumbnail
+	thumbDir := t.TempDir()
+	thumbPath := filepath.Join(thumbDir, "thumb.png")
+	if err := os.WriteFile(thumbPath, []byte("png-data"), 0o644); err != nil {
+		t.Fatalf("write thumb: %v", err)
+	}
+
+	_, err := env.client.UploadThumbnail(ctx, env.content, thumbPath, UploadOptions{
+		FileName: "thumb.png",
+		MimeType: "image/png",
+		Width:    256,
+		Height:   256,
+	})
+	if err != nil {
+		t.Fatalf("UploadThumbnail error: %v", err)
+	}
+
+	// Now try to get thumbnails by size
+	thumbnails, err := env.client.GetThumbnailsBySize(ctx, env.content.ID, []string{"256"})
+	if err != nil {
+		t.Fatalf("GetThumbnailsBySize error: %v", err)
+	}
+
+	if len(thumbnails) != 1 {
+		t.Fatalf("expected 1 thumbnail, got %d", len(thumbnails))
+	}
+
+	if thumbnails[0].DerivationType != "thumbnail" {
+		t.Fatalf("expected derivation type thumbnail, got %s", thumbnails[0].DerivationType)
+	}
+}
