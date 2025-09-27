@@ -40,7 +40,6 @@ type DerivationParams struct {
 type ThumbnailResult struct {
 	Size             string            `json:"size"`
 	ContentID        string            `json:"content_id"`
-	ObjectID         string            `json:"object_id"`
 	UploadURL        string            `json:"upload_url,omitempty"`
 	Width            int               `json:"width"`
 	Height           int               `json:"height"`

@@ -17,7 +17,6 @@ type testEnv struct {
 	svc     simplecontent.Service
 	client  *Client
 	content *simplecontent.Content
-	object  *simplecontent.Object
 }
 
 func newTestEnv(t *testing.T) *testEnv {
@@ -56,7 +55,6 @@ func newTestEnv(t *testing.T) *testEnv {
 		svc:     svc,
 		client:  NewClient(svc, "memory"),
 		content: content,
-		object:  nil, // No longer needed with new API
 	}
 }
 

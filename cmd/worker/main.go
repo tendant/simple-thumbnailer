@@ -561,7 +561,6 @@ func uploadResultsStep(ctx context.Context, parent *simplecontent.Content, thumb
 		results = append(results, schema.ThumbnailResult{
 			Size:             thumb.Name,
 			ContentID:        result.Content.ID.String(),
-			ObjectID:         "", // No longer using object-level operations
 			UploadURL:        "", // URL generation handled by content service
 			Width:            thumb.Width,
 			Height:           thumb.Height,
