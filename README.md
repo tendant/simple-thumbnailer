@@ -16,6 +16,7 @@ A Go worker that generates multiple thumbnail sizes from images using NATS job p
 ```bash
 # Build and test
 go build -tags nats ./cmd/worker
+go build -tags nats ./cmd/backfill
 go test -tags nats ./...  # Run all tests
 go test ./...             # Run tests without NATS worker
 
@@ -27,7 +28,38 @@ make run-worker
 
 ## Usage
 
-Publish a job (requires nats CLI):
+### Backfill Thumbnails for Existing Images
+
+Generate thumbnails for all existing images in your content database:
+
+```bash
+# Build the backfill tool
+go build -tags nats -o backfill ./cmd/backfill
+
+# Dry-run to see what would be processed
+./backfill -dry-run
+
+# Process all images missing thumbnails
+./backfill
+
+# Process only first 100 images
+./backfill -batch 100
+
+# Process all images (even those with existing thumbnails)
+./backfill -only-missing=false
+```
+
+**Backfill Options:**
+- `-dry-run` — Show what would be processed without publishing jobs
+- `-batch N` — Process only first N images (0 = unlimited, default: 0)
+- `-only-missing` — Only process images without thumbnails (default: true)
+
+**Environment Variables:**
+- `THUMBNAIL_SIZES_BACKFILL` — Sizes to generate (default: "small,medium,large")
+
+### Manual Job Publishing
+
+Publish a single job (requires nats CLI):
 ```bash
 nats pub simple-process.jobs '{
   "id": "job-1",
