@@ -16,6 +16,7 @@ import (
 	"github.com/joho/godotenv"
 
 	simplecontent "github.com/tendant/simple-content/pkg/simplecontent"
+	"github.com/tendant/simple-content/pkg/simplecontent/admin"
 	simpleconfig "github.com/tendant/simple-content/pkg/simplecontent/config"
 	"github.com/tendant/simple-process/pkg/contracts"
 
@@ -29,6 +30,8 @@ type config struct {
 	BatchSize        int
 	DryRun           bool
 	OnlyMissingThumbs bool
+	OwnerID          string
+	TenantID         string
 }
 
 func main() {
@@ -64,6 +67,14 @@ func main() {
 	}
 	logger.Info("simplecontent service ready")
 
+	// Build admin service
+	repo, err := contentCfg.BuildRepository()
+	if err != nil {
+		fatal(logger, "build repository", err)
+	}
+	adminSvc := admin.New(repo)
+	logger.Info("admin service ready")
+
 	// Connect to NATS (skip if dry-run)
 	var nc *bus.Client
 	if !cfg.DryRun {
@@ -78,10 +89,12 @@ func main() {
 	ctx := context.Background()
 
 	// Discover images needing thumbnails
-	logger.Info("discovering images...")
-	images, err := discoverImages(ctx, contentSvc, logger)
+	logger.Info("discovering images...", "owner_id", cfg.OwnerID, "tenant_id", cfg.TenantID)
+	images, err := discoverImages(ctx, adminSvc, contentSvc, cfg, logger)
 	if err != nil {
-		fatal(logger, "discover images", err)
+		// Print error directly for better formatting
+		fmt.Fprintf(os.Stderr, "\nError: %v\n\n", err)
+		os.Exit(1)
 	}
 	logger.Info("discovered images", "total", len(images))
 
@@ -151,15 +164,27 @@ func loadConfig() config {
 		NATSURL:          getenv("NATS_URL", "nats://127.0.0.1:4222"),
 		JobSubject:       getenv("PROCESS_SUBJECT", "simple-process.jobs"),
 		ThumbnailSizes:   getenv("THUMBNAIL_SIZES_BACKFILL", "small,medium,large"),
+		OwnerID:          getenv("BACKFILL_OWNER_ID", ""),
+		TenantID:         getenv("BACKFILL_TENANT_ID", ""),
 		BatchSize:        0,
-		DryRun:           false,
+		DryRun:           true, // Default to dry-run for safety
 		OnlyMissingThumbs: true,
 	}
 
 	flag.IntVar(&cfg.BatchSize, "batch", 0, "Maximum number of images to process (0 = unlimited)")
-	flag.BoolVar(&cfg.DryRun, "dry-run", false, "Show what would be processed without publishing jobs")
+	flag.BoolVar(&cfg.DryRun, "dry-run", true, "Show what would be processed without publishing jobs (default: true)")
 	flag.BoolVar(&cfg.OnlyMissingThumbs, "only-missing", true, "Only process images missing thumbnails")
+	flag.StringVar(&cfg.OwnerID, "owner-id", cfg.OwnerID, "Filter by owner ID (empty = all owners)")
+	flag.StringVar(&cfg.TenantID, "tenant-id", cfg.TenantID, "Filter by tenant ID (empty = all tenants)")
+
+	var execute bool
+	flag.BoolVar(&execute, "execute", false, "Actually publish jobs (disables dry-run)")
 	flag.Parse()
+
+	// If --execute is specified, disable dry-run
+	if execute {
+		cfg.DryRun = false
+	}
 
 	return cfg
 }
@@ -173,20 +198,66 @@ func loadSimpleContentConfig() (*simpleconfig.ServerConfig, error) {
 }
 
 // discoverImages queries all uploaded content that are source images (not derived)
-func discoverImages(ctx context.Context, svc simplecontent.Service, logger *slog.Logger) ([]*simplecontent.Content, error) {
-	// List all content (this will need to be paginated for large datasets)
-	allContent, err := svc.ListContent(ctx, simplecontent.ListContentRequest{})
-	if err != nil {
-		return nil, fmt.Errorf("list content: %w", err)
+func discoverImages(ctx context.Context, adminSvc admin.AdminService, svc simplecontent.Service, cfg config, logger *slog.Logger) ([]*simplecontent.Content, error) {
+	var allContent []*simplecontent.Content
+	var err error
+
+	// Build filters for admin API
+	filters := admin.ContentFilters{}
+
+	// Apply owner/tenant filters if specified
+	if cfg.OwnerID != "" {
+		ownerID, err := uuid.Parse(cfg.OwnerID)
+		if err != nil {
+			return nil, fmt.Errorf("invalid owner ID: %w", err)
+		}
+		filters.OwnerID = &ownerID
 	}
 
+	if cfg.TenantID != "" {
+		tenantID, err := uuid.Parse(cfg.TenantID)
+		if err != nil {
+			return nil, fmt.Errorf("invalid tenant ID: %w", err)
+		}
+		filters.TenantID = &tenantID
+	}
+
+	// Use admin API to list all contents (no owner/tenant restriction)
+	logger.Info("using admin API to list all content")
+	resp, err := adminSvc.ListAllContents(ctx, admin.ListContentsRequest{
+		Filters: filters,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("list all contents: %w", err)
+	}
+	allContent = resp.Contents
+
+	logger.Info("fetched all content", "total", len(allContent))
+
 	var images []*simplecontent.Content
+	statusCounts := make(map[string]int)
+	derivationCounts := make(map[bool]int)
+	mimeTypeCounts := make(map[string]int)
+	deletedCount := 0
+
 	for _, content := range allContent {
+		statusCounts[content.Status]++
+		derivationCounts[content.DerivationType != ""]++
+
+		// Skip deleted content
+		if content.DeletedAt != nil {
+			logger.Debug("skipping deleted content", "content_id", content.ID, "deleted_at", content.DeletedAt)
+			deletedCount++
+			continue
+		}
+
 		// Only process uploaded source content (not derived)
 		if content.Status != string(simplecontent.ContentStatusUploaded) {
+			logger.Debug("skipping non-uploaded content", "content_id", content.ID, "status", content.Status)
 			continue
 		}
 		if content.DerivationType != "" {
+			logger.Debug("skipping derived content", "content_id", content.ID, "derivation_type", content.DerivationType)
 			continue
 		}
 
@@ -197,10 +268,24 @@ func discoverImages(ctx context.Context, svc simplecontent.Service, logger *slog
 			continue
 		}
 
+		mimeTypeCounts[metadata.MimeType]++
+
 		if isImage(metadata.MimeType) {
+			logger.Debug("found image", "content_id", content.ID, "mime_type", metadata.MimeType, "file_name", metadata.FileName)
 			images = append(images, content)
+		} else {
+			logger.Debug("skipping non-image", "content_id", content.ID, "mime_type", metadata.MimeType)
 		}
 	}
+
+	logger.Info("discovery summary",
+		"total_content", len(allContent),
+		"deleted", deletedCount,
+		"status_counts", statusCounts,
+		"has_derivation", derivationCounts,
+		"mime_types", mimeTypeCounts,
+		"images_found", len(images),
+	)
 
 	return images, nil
 }

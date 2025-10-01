@@ -36,26 +36,63 @@ Generate thumbnails for all existing images in your content database:
 # Build the backfill tool
 go build -tags nats -o backfill ./cmd/backfill
 
-# Dry-run to see what would be processed
-./backfill -dry-run
-
-# Process all images missing thumbnails
+# Preview what would be processed (dry-run is default)
 ./backfill
 
+# With specific owner/tenant (recommended for multi-tenant systems)
+export BACKFILL_OWNER_ID="aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+export BACKFILL_TENANT_ID="aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+./backfill
+
+# Or via flags
+./backfill -owner-id "uuid" -tenant-id "uuid"
+
+# Actually publish jobs (after verifying with dry-run)
+./backfill -execute
+
 # Process only first 100 images
-./backfill -batch 100
+./backfill -execute -batch 100
 
 # Process all images (even those with existing thumbnails)
-./backfill -only-missing=false
+./backfill -execute -only-missing=false
+
+# Disable dry-run mode explicitly
+./backfill -dry-run=false
 ```
 
+**Backfill Behavior:**
+- Automatically skips deleted content (where `deleted_at IS NOT NULL`)
+- Only processes uploaded source images (not derived content)
+- Filters by MIME type to only process `image/*` files
+
 **Backfill Options:**
-- `-dry-run` — Show what would be processed without publishing jobs
+- `-execute` — Actually publish jobs to NATS (default: false, runs in dry-run mode)
+- `-dry-run` — Show what would be processed without publishing jobs (default: true)
 - `-batch N` — Process only first N images (0 = unlimited, default: 0)
 - `-only-missing` — Only process images without thumbnails (default: true)
+- `-owner-id` — Filter by owner ID (optional)
+- `-tenant-id` — Filter by tenant ID (optional)
 
 **Environment Variables:**
+- `BACKFILL_OWNER_ID` — Owner UUID to filter content (optional)
+- `BACKFILL_TENANT_ID` — Tenant UUID to filter content (optional)
 - `THUMBNAIL_SIZES_BACKFILL` — Sizes to generate (default: "small,medium,large")
+
+**Finding Owner/Tenant IDs:**
+
+If you see an error about missing owner/tenant IDs, find them using:
+
+```bash
+# Using psql directly
+psql "$DATABASE_URL" -c "SELECT DISTINCT owner_id, tenant_id FROM content.content LIMIT 5;"
+
+# Or with Docker
+docker exec -it postgres-container psql -U username -d dbname -c "SELECT DISTINCT owner_id, tenant_id FROM content.content LIMIT 5;"
+
+# Then set them
+export BACKFILL_OWNER_ID="uuid-from-query"
+export BACKFILL_TENANT_ID="uuid-from-query"
+```
 
 ### Manual Job Publishing
 
