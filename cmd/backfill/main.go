@@ -17,6 +17,7 @@ import (
 
 	simplecontent "github.com/tendant/simple-content/pkg/simplecontent"
 	"github.com/tendant/simple-content/pkg/simplecontent/admin"
+	"github.com/tendant/simple-content/pkg/simplecontent/scan"
 	simpleconfig "github.com/tendant/simple-content/pkg/simplecontent/config"
 	"github.com/tendant/simple-process/pkg/contracts"
 
@@ -88,75 +89,44 @@ func main() {
 
 	ctx := context.Background()
 
-	// Discover images needing thumbnails
-	logger.Info("discovering images...", "owner_id", cfg.OwnerID, "tenant_id", cfg.TenantID)
-	images, err := discoverImages(ctx, adminSvc, contentSvc, cfg, logger)
+	// Build content filters
+	filters := buildFilters(cfg, logger)
+
+	// Create scanner
+	scanner := scan.New(adminSvc)
+
+	// Create processor
+	var processor scan.ContentProcessor
+	if !cfg.DryRun {
+		processor = NewThumbnailJobProcessor(nc, contentSvc, cfg, logger)
+	}
+
+	// Run scan
+	logger.Info("scanning for images needing thumbnails...")
+	result, err := scanner.Scan(ctx, scan.ScanOptions{
+		Filters:   filters,
+		Processor: processor,
+		DryRun:    cfg.DryRun,
+		BatchSize: 100,
+		Limit:     cfg.BatchSize, // Use scanner's built-in limit
+		OnProgress: func(processed, total int64) {
+			logger.Info("scan progress", "processed", processed, "total", total)
+		},
+	})
 	if err != nil {
-		// Print error directly for better formatting
-		fmt.Fprintf(os.Stderr, "\nError: %v\n\n", err)
-		os.Exit(1)
-	}
-	logger.Info("discovered images", "total", len(images))
-
-	if len(images) == 0 {
-		logger.Info("no images to process")
-		return
-	}
-
-	// Filter images that need thumbnails
-	if cfg.OnlyMissingThumbs {
-		logger.Info("filtering images that already have thumbnails...")
-		images, err = filterImagesNeedingThumbnails(ctx, contentSvc, images, cfg.ThumbnailSizes, logger)
-		if err != nil {
-			fatal(logger, "filter images", err)
-		}
-		logger.Info("images needing thumbnails", "count", len(images))
-	}
-
-	if len(images) == 0 {
-		logger.Info("no images need thumbnails")
-		return
-	}
-
-	// Apply batch limit
-	if cfg.BatchSize > 0 && len(images) > cfg.BatchSize {
-		logger.Info("limiting to batch size", "batch_size", cfg.BatchSize)
-		images = images[:cfg.BatchSize]
-	}
-
-	// Publish jobs
-	logger.Info("publishing jobs", "count", len(images), "dry_run", cfg.DryRun)
-	published := 0
-	failed := 0
-
-	for i, img := range images {
-		jobLogger := logger.With("content_id", img.ID, "progress", fmt.Sprintf("%d/%d", i+1, len(images)))
-
-		if cfg.DryRun {
-			jobLogger.Info("would publish job (dry-run)", "name", img.Name, "status", img.Status)
-			published++
-			continue
-		}
-
-		if err := publishThumbnailJob(nc, cfg.JobSubject, img.ID, cfg.ThumbnailSizes); err != nil {
-			jobLogger.Error("failed to publish job", "err", err)
-			failed++
-			continue
-		}
-
-		jobLogger.Info("published job", "name", img.Name)
-		published++
-
-		// Small delay to avoid overwhelming the queue
-		time.Sleep(10 * time.Millisecond)
+		fatal(logger, "scan failed", err)
 	}
 
 	logger.Info("backfill complete",
-		"total", len(images),
-		"published", published,
-		"failed", failed,
+		"total_found", result.TotalFound,
+		"processed", result.TotalProcessed,
+		"failed", result.TotalFailed,
 		"dry_run", cfg.DryRun,
 	)
+
+	if result.TotalFailed > 0 {
+		logger.Error("some jobs failed", "failed_ids", result.FailedIDs)
+	}
 }
 
 func loadConfig() config {
@@ -171,7 +141,7 @@ func loadConfig() config {
 		OnlyMissingThumbs: true,
 	}
 
-	flag.IntVar(&cfg.BatchSize, "batch", 0, "Maximum number of images to process (0 = unlimited)")
+	flag.IntVar(&cfg.BatchSize, "batch", 0, "Limit total number of items to process (0 = unlimited)")
 	flag.BoolVar(&cfg.DryRun, "dry-run", true, "Show what would be processed without publishing jobs (default: true)")
 	flag.BoolVar(&cfg.OnlyMissingThumbs, "only-missing", true, "Only process images missing thumbnails")
 	flag.StringVar(&cfg.OwnerID, "owner-id", cfg.OwnerID, "Filter by owner ID (empty = all owners)")
@@ -197,139 +167,125 @@ func loadSimpleContentConfig() (*simpleconfig.ServerConfig, error) {
 	return cfg, nil
 }
 
-// discoverImages queries all uploaded content that are source images (not derived)
-func discoverImages(ctx context.Context, adminSvc admin.AdminService, svc simplecontent.Service, cfg config, logger *slog.Logger) ([]*simplecontent.Content, error) {
-	var allContent []*simplecontent.Content
-	var err error
-
-	// Build filters for admin API
+// buildFilters constructs admin content filters based on config
+func buildFilters(cfg config, logger *slog.Logger) admin.ContentFilters {
 	filters := admin.ContentFilters{}
 
-	// Apply owner/tenant filters if specified
+	// Filter by owner/tenant if specified
 	if cfg.OwnerID != "" {
 		ownerID, err := uuid.Parse(cfg.OwnerID)
 		if err != nil {
-			return nil, fmt.Errorf("invalid owner ID: %w", err)
+			logger.Warn("invalid owner ID, ignoring", "owner_id", cfg.OwnerID, "err", err)
+		} else {
+			filters.OwnerID = &ownerID
 		}
-		filters.OwnerID = &ownerID
 	}
 
 	if cfg.TenantID != "" {
 		tenantID, err := uuid.Parse(cfg.TenantID)
 		if err != nil {
-			return nil, fmt.Errorf("invalid tenant ID: %w", err)
-		}
-		filters.TenantID = &tenantID
-	}
-
-	// Use admin API to list all contents (no owner/tenant restriction)
-	logger.Info("using admin API to list all content")
-	resp, err := adminSvc.ListAllContents(ctx, admin.ListContentsRequest{
-		Filters: filters,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("list all contents: %w", err)
-	}
-	allContent = resp.Contents
-
-	logger.Info("fetched all content", "total", len(allContent))
-
-	var images []*simplecontent.Content
-	statusCounts := make(map[string]int)
-	derivationCounts := make(map[bool]int)
-	mimeTypeCounts := make(map[string]int)
-	deletedCount := 0
-
-	for _, content := range allContent {
-		statusCounts[content.Status]++
-		derivationCounts[content.DerivationType != ""]++
-
-		// Skip deleted content
-		if content.DeletedAt != nil {
-			logger.Debug("skipping deleted content", "content_id", content.ID, "deleted_at", content.DeletedAt)
-			deletedCount++
-			continue
-		}
-
-		// Only process uploaded source content (not derived)
-		if content.Status != string(simplecontent.ContentStatusUploaded) {
-			logger.Debug("skipping non-uploaded content", "content_id", content.ID, "status", content.Status)
-			continue
-		}
-		if content.DerivationType != "" {
-			logger.Debug("skipping derived content", "content_id", content.ID, "derivation_type", content.DerivationType)
-			continue
-		}
-
-		// Check if it's an image by metadata
-		metadata, err := svc.GetContentMetadata(ctx, content.ID)
-		if err != nil {
-			logger.Warn("failed to get metadata", "content_id", content.ID, "err", err)
-			continue
-		}
-
-		mimeTypeCounts[metadata.MimeType]++
-
-		if isImage(metadata.MimeType) {
-			logger.Debug("found image", "content_id", content.ID, "mime_type", metadata.MimeType, "file_name", metadata.FileName)
-			images = append(images, content)
+			logger.Warn("invalid tenant ID, ignoring", "tenant_id", cfg.TenantID, "err", err)
 		} else {
-			logger.Debug("skipping non-image", "content_id", content.ID, "mime_type", metadata.MimeType)
+			filters.TenantID = &tenantID
 		}
 	}
 
-	logger.Info("discovery summary",
-		"total_content", len(allContent),
-		"deleted", deletedCount,
-		"status_counts", statusCounts,
-		"has_derivation", derivationCounts,
-		"mime_types", mimeTypeCounts,
-		"images_found", len(images),
-	)
+	// Only process uploaded content (not created/pending)
+	uploadedStatus := string(simplecontent.ContentStatusUploaded)
+	filters.Status = &uploadedStatus
 
-	return images, nil
+	return filters
 }
 
-// filterImagesNeedingThumbnails checks which images are missing the requested thumbnail sizes
-func filterImagesNeedingThumbnails(ctx context.Context, svc simplecontent.Service, images []*simplecontent.Content, sizesStr string, logger *slog.Logger) ([]*simplecontent.Content, error) {
-	requestedSizes := parseSizes(sizesStr)
-	var needsThumbnails []*simplecontent.Content
+// ThumbnailJobProcessor processes content by publishing thumbnail generation jobs
+type ThumbnailJobProcessor struct {
+	nc     *bus.Client
+	svc    simplecontent.Service
+	cfg    config
+	logger *slog.Logger
+}
 
-	for _, img := range images {
-		// Get existing thumbnails for this image
-		existing, err := svc.ListDerivedContent(ctx,
-			simplecontent.WithParentID(img.ID),
-			simplecontent.WithDerivationType("thumbnail"),
-		)
+// NewThumbnailJobProcessor creates a new processor for publishing thumbnail jobs
+func NewThumbnailJobProcessor(nc *bus.Client, svc simplecontent.Service, cfg config, logger *slog.Logger) *ThumbnailJobProcessor {
+	return &ThumbnailJobProcessor{
+		nc:     nc,
+		svc:    svc,
+		cfg:    cfg,
+		logger: logger,
+	}
+}
+
+// Process implements scan.ContentProcessor
+func (p *ThumbnailJobProcessor) Process(ctx context.Context, content *simplecontent.Content) error {
+	// Skip if not an image or is derived content
+	if content.DerivationType != "" {
+		p.logger.Debug("skipping derived content", "content_id", content.ID, "derivation_type", content.DerivationType)
+		return nil
+	}
+
+	// Check if it's an image
+	metadata, err := p.svc.GetContentMetadata(ctx, content.ID)
+	if err != nil {
+		return fmt.Errorf("get metadata: %w", err)
+	}
+
+	if !isImage(metadata.MimeType) {
+		p.logger.Debug("skipping non-image", "content_id", content.ID, "mime_type", metadata.MimeType)
+		return nil
+	}
+
+	// Check if thumbnails already exist (if only_missing is enabled)
+	if p.cfg.OnlyMissingThumbs {
+		needsThumbnails, err := checkNeedsThumbnails(ctx, p.svc, content.ID, p.cfg.ThumbnailSizes)
 		if err != nil {
-			logger.Warn("failed to list derived content", "content_id", img.ID, "err", err)
-			// Include it anyway to be safe
-			needsThumbnails = append(needsThumbnails, img)
-			continue
-		}
-
-		// Check if any requested size is missing
-		existingVariants := make(map[string]bool)
-		for _, derived := range existing {
-			existingVariants[derived.Variant] = true
-		}
-
-		missing := false
-		for _, size := range requestedSizes {
-			// Variants are stored as "thumbnail_small", "thumbnail_medium", etc.
-			variant := "thumbnail_" + size
-			if !existingVariants[variant] {
-				missing = true
-				break
-			}
-		}
-
-		if missing {
-			needsThumbnails = append(needsThumbnails, img)
+			p.logger.Warn("failed to check existing thumbnails", "content_id", content.ID, "err", err)
+			// Continue processing to be safe
+		} else if !needsThumbnails {
+			p.logger.Debug("skipping, all thumbnails exist", "content_id", content.ID)
+			return nil
 		}
 	}
 
-	return needsThumbnails, nil
+	// Publish job
+	if err := publishThumbnailJob(p.nc, p.cfg.JobSubject, content.ID, p.cfg.ThumbnailSizes); err != nil {
+		return fmt.Errorf("publish job: %w", err)
+	}
+
+	p.logger.Info("published thumbnail job", "content_id", content.ID, "name", content.Name)
+
+	// Small delay to avoid overwhelming the queue
+	time.Sleep(10 * time.Millisecond)
+
+	return nil
+}
+
+// checkNeedsThumbnails checks if any of the requested thumbnail sizes are missing
+func checkNeedsThumbnails(ctx context.Context, svc simplecontent.Service, contentID uuid.UUID, sizesStr string) (bool, error) {
+	requestedSizes := parseSizes(sizesStr)
+
+	// Get existing thumbnails
+	existing, err := svc.ListDerivedContent(ctx,
+		simplecontent.WithParentID(contentID),
+		simplecontent.WithDerivationType("thumbnail"),
+	)
+	if err != nil {
+		return false, err
+	}
+
+	// Check if any requested size is missing
+	existingVariants := make(map[string]bool)
+	for _, derived := range existing {
+		existingVariants[derived.Variant] = true
+	}
+
+	for _, size := range requestedSizes {
+		variant := "thumbnail_" + size
+		if !existingVariants[variant] {
+			return true, nil
+		}
+	}
+
+	return false, nil
 }
 
 // publishThumbnailJob publishes a job to NATS for thumbnail generation
