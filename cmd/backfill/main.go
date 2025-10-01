@@ -29,6 +29,7 @@ type config struct {
 	JobSubject       string
 	ThumbnailSizes   string
 	BatchSize        int
+	Limit            int
 	DryRun           bool
 	OnlyMissingThumbs bool
 	OwnerID          string
@@ -47,6 +48,7 @@ func main() {
 		"job_subject", cfg.JobSubject,
 		"thumbnail_sizes", cfg.ThumbnailSizes,
 		"batch_size", cfg.BatchSize,
+		"limit", cfg.Limit,
 		"dry_run", cfg.DryRun,
 		"only_missing", cfg.OnlyMissingThumbs,
 	)
@@ -96,19 +98,26 @@ func main() {
 	scanner := scan.New(adminSvc)
 
 	// Create processor
-	var processor scan.ContentProcessor
+	var processor *ThumbnailJobProcessor
 	if !cfg.DryRun {
 		processor = NewThumbnailJobProcessor(nc, contentSvc, cfg, logger)
 	}
 
 	// Run scan
 	logger.Info("scanning for images needing thumbnails...")
+
+	// Determine batch size (default 100 if not specified)
+	batchSize := cfg.BatchSize
+	if batchSize == 0 {
+		batchSize = 100
+	}
+
 	result, err := scanner.Scan(ctx, scan.ScanOptions{
 		Filters:   filters,
 		Processor: processor,
 		DryRun:    cfg.DryRun,
-		BatchSize: 100,
-		Limit:     cfg.BatchSize, // Use scanner's built-in limit
+		BatchSize: batchSize,
+		Limit:     cfg.Limit, // 0 = unlimited
 		OnProgress: func(processed, total int64) {
 			logger.Info("scan progress", "processed", processed, "total", total)
 		},
@@ -117,12 +126,25 @@ func main() {
 		fatal(logger, "scan failed", err)
 	}
 
-	logger.Info("backfill complete",
-		"total_found", result.TotalFound,
-		"processed", result.TotalProcessed,
-		"failed", result.TotalFailed,
-		"dry_run", cfg.DryRun,
-	)
+	// Show detailed statistics when not in dry-run
+	if !cfg.DryRun && processor != nil {
+		published, skippedNonImage, skippedHasThumbs := processor.Stats()
+		logger.Info("backfill complete",
+			"total_found", result.TotalFound,
+			"processed", result.TotalProcessed,
+			"failed", result.TotalFailed,
+			"jobs_published", published,
+			"skipped_non_image", skippedNonImage,
+			"skipped_has_thumbs", skippedHasThumbs,
+		)
+	} else {
+		logger.Info("backfill complete",
+			"total_found", result.TotalFound,
+			"processed", result.TotalProcessed,
+			"failed", result.TotalFailed,
+			"dry_run", cfg.DryRun,
+		)
+	}
 
 	if result.TotalFailed > 0 {
 		logger.Error("some jobs failed", "failed_ids", result.FailedIDs)
@@ -137,12 +159,14 @@ func loadConfig() config {
 		OwnerID:          getenv("BACKFILL_OWNER_ID", ""),
 		TenantID:         getenv("BACKFILL_TENANT_ID", ""),
 		BatchSize:        0,
+		Limit:            0,
 		DryRun:           true, // Default to dry-run for safety
 		OnlyMissingThumbs: true,
 	}
 
-	flag.IntVar(&cfg.BatchSize, "batch", 0, "Limit total number of items to process (0 = unlimited)")
-	flag.BoolVar(&cfg.DryRun, "dry-run", true, "Show what would be processed without publishing jobs (default: true)")
+	flag.IntVar(&cfg.BatchSize, "batch", 100, "Number of items to query per batch (default: 100)")
+	flag.IntVar(&cfg.Limit, "limit", 0, "Maximum total number of items to process (0 = unlimited)")
+	flag.BoolVar(&cfg.DryRun, "dry-run", true, "Show what would be processed without publishing jobs")
 	flag.BoolVar(&cfg.OnlyMissingThumbs, "only-missing", true, "Only process images missing thumbnails")
 	flag.StringVar(&cfg.OwnerID, "owner-id", cfg.OwnerID, "Filter by owner ID (empty = all owners)")
 	flag.StringVar(&cfg.TenantID, "tenant-id", cfg.TenantID, "Filter by tenant ID (empty = all tenants)")
@@ -194,15 +218,22 @@ func buildFilters(cfg config, logger *slog.Logger) admin.ContentFilters {
 	uploadedStatus := string(simplecontent.ContentStatusUploaded)
 	filters.Status = &uploadedStatus
 
+	// Exclude derived content (thumbnails, etc.) - we only want source images
+	emptyString := ""
+	filters.DerivationType = &emptyString
+
 	return filters
 }
 
 // ThumbnailJobProcessor processes content by publishing thumbnail generation jobs
 type ThumbnailJobProcessor struct {
-	nc     *bus.Client
-	svc    simplecontent.Service
-	cfg    config
-	logger *slog.Logger
+	nc              *bus.Client
+	svc             simplecontent.Service
+	cfg             config
+	logger          *slog.Logger
+	jobsPublished   int
+	skippedNonImage int
+	skippedHasThumbs int
 }
 
 // NewThumbnailJobProcessor creates a new processor for publishing thumbnail jobs
@@ -213,6 +244,11 @@ func NewThumbnailJobProcessor(nc *bus.Client, svc simplecontent.Service, cfg con
 		cfg:    cfg,
 		logger: logger,
 	}
+}
+
+// Stats returns statistics about the processing
+func (p *ThumbnailJobProcessor) Stats() (jobsPublished, skippedNonImage, skippedHasThumbs int) {
+	return p.jobsPublished, p.skippedNonImage, p.skippedHasThumbs
 }
 
 // Process implements scan.ContentProcessor
@@ -230,7 +266,8 @@ func (p *ThumbnailJobProcessor) Process(ctx context.Context, content *simplecont
 	}
 
 	if !isImage(metadata.MimeType) {
-		p.logger.Debug("skipping non-image", "content_id", content.ID, "mime_type", metadata.MimeType)
+		p.skippedNonImage++
+		p.logger.Info("skipping non-image", "content_id", content.ID, "name", content.Name, "mime_type", metadata.MimeType)
 		return nil
 	}
 
@@ -241,7 +278,8 @@ func (p *ThumbnailJobProcessor) Process(ctx context.Context, content *simplecont
 			p.logger.Warn("failed to check existing thumbnails", "content_id", content.ID, "err", err)
 			// Continue processing to be safe
 		} else if !needsThumbnails {
-			p.logger.Debug("skipping, all thumbnails exist", "content_id", content.ID)
+			p.skippedHasThumbs++
+			p.logger.Info("skipping, all thumbnails exist", "content_id", content.ID, "name", content.Name)
 			return nil
 		}
 	}
@@ -251,7 +289,8 @@ func (p *ThumbnailJobProcessor) Process(ctx context.Context, content *simplecont
 		return fmt.Errorf("publish job: %w", err)
 	}
 
-	p.logger.Info("published thumbnail job", "content_id", content.ID, "name", content.Name)
+	p.jobsPublished++
+	p.logger.Info("published thumbnail job", "content_id", content.ID, "name", content.Name, "jobs_published", p.jobsPublished)
 
 	// Small delay to avoid overwhelming the queue
 	time.Sleep(10 * time.Millisecond)
