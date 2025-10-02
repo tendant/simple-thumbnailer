@@ -9,8 +9,6 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"strings"
-	"time"
 
 	"github.com/google/uuid"
 	"github.com/joho/godotenv"
@@ -19,7 +17,6 @@ import (
 	"github.com/tendant/simple-content/pkg/simplecontent/admin"
 	"github.com/tendant/simple-content/pkg/simplecontent/scan"
 	simpleconfig "github.com/tendant/simple-content/pkg/simplecontent/config"
-	"github.com/tendant/simple-process/pkg/contracts"
 
 	"github.com/tendant/simple-thumbnailer/internal/bus"
 )
@@ -130,15 +127,12 @@ func main() {
 
 	// Show detailed statistics when not in dry-run
 	if !cfg.DryRun && processor != nil {
-		published, skippedNonImage, skippedHasThumbs, statusVerified := processor.Stats()
+		statusUpdated := processor.Stats()
 		logger.Info("backfill complete",
 			"total_found", result.TotalFound,
 			"processed", result.TotalProcessed,
 			"failed", result.TotalFailed,
-			"jobs_published", published,
-			"skipped_non_image", skippedNonImage,
-			"skipped_has_thumbs", skippedHasThumbs,
-			"status_verified", statusVerified,
+			"status_updated", statusUpdated,
 		)
 	} else {
 		logger.Info("backfill complete",
@@ -219,32 +213,30 @@ func buildFilters(cfg config, logger *slog.Logger) admin.ContentFilters {
 		}
 	}
 
-	// Only process uploaded content (exclude created, deleted, failed, etc.)
-	// We should only fix status for uploaded content that has correct thumbnails
+	// Only process derived content that might need status fixing
+	// Target content that is created or uploaded (may need to be processed)
 	filters.Statuses = []string{
+		string(simplecontent.ContentStatusCreated),
 		string(simplecontent.ContentStatusUploaded),
 	}
 
-	// Exclude derived content (thumbnails, etc.) - we only want source images
-	emptyString := ""
-	filters.DerivationType = &emptyString
+	// Only process derived content (thumbnails) - backfill is for derived content only
+	derivationType := "thumbnail"
+	filters.DerivationType = &derivationType
 
 	return filters
 }
 
-// ThumbnailJobProcessor processes content by publishing thumbnail generation jobs
+// ThumbnailJobProcessor processes derived content to verify and fix status
 type ThumbnailJobProcessor struct {
-	nc              *bus.Client
-	svc             simplecontent.Service
-	cfg             config
-	logger          *slog.Logger
-	jobsPublished   int
-	skippedNonImage int
-	skippedHasThumbs int
-	statusUpdated   int
+	nc            *bus.Client
+	svc           simplecontent.Service
+	cfg           config
+	logger        *slog.Logger
+	statusUpdated int
 }
 
-// NewThumbnailJobProcessor creates a new processor for publishing thumbnail jobs
+// NewThumbnailJobProcessor creates a new processor for verifying and fixing derived content status
 func NewThumbnailJobProcessor(nc *bus.Client, svc simplecontent.Service, cfg config, logger *slog.Logger) *ThumbnailJobProcessor {
 	return &ThumbnailJobProcessor{
 		nc:     nc,
@@ -255,224 +247,71 @@ func NewThumbnailJobProcessor(nc *bus.Client, svc simplecontent.Service, cfg con
 }
 
 // Stats returns statistics about the processing
-func (p *ThumbnailJobProcessor) Stats() (jobsPublished, skippedNonImage, skippedHasThumbs, statusUpdated int) {
-	return p.jobsPublished, p.skippedNonImage, p.skippedHasThumbs, p.statusUpdated
+func (p *ThumbnailJobProcessor) Stats() (statusUpdated int) {
+	return p.statusUpdated
 }
 
-// fixContentStatus fixes derived content status based on object status verification
-// This ensures content status accurately reflects the actual state of underlying objects
-func (p *ThumbnailJobProcessor) fixContentStatus(ctx context.Context, content *simplecontent.Content) error {
-	// Get derived content relationships
-	derived, err := p.svc.ListDerivedContent(ctx,
-		simplecontent.WithParentID(content.ID),
-		simplecontent.WithDerivationType("thumbnail"),
-	)
+// fixDerivedContentStatus fixes derived content status based on object status verification
+// This ensures derived content status accurately reflects the actual state of underlying objects
+func (p *ThumbnailJobProcessor) fixDerivedContentStatus(ctx context.Context, derivedContent *simplecontent.Content) error {
+	// Get objects to verify actual status
+	objects, err := p.svc.GetObjectsByContentID(ctx, derivedContent.ID)
 	if err != nil {
-		return fmt.Errorf("list derived content: %w", err)
+		return fmt.Errorf("failed to get objects: %w", err)
 	}
 
-	if len(derived) == 0 {
-		p.logger.Warn("no derived content found", "content_id", content.ID)
+	if len(objects) == 0 {
+		p.logger.Warn("no objects found for derived content", "content_id", derivedContent.ID)
 		return nil
 	}
 
-	// Fix derived content status based on object status
-	derivedFixed := 0
-	for _, d := range derived {
-		// Get actual content record
-		derivedContent, err := p.svc.GetContent(ctx, d.ContentID)
-		if err != nil {
-			p.logger.Warn("failed to get derived content", "derived_id", d.ContentID, "err", err)
-			continue
-		}
-
-		// Get objects to verify actual status
-		objects, err := p.svc.GetObjectsByContentID(ctx, d.ContentID)
-		if err != nil {
-			p.logger.Warn("failed to get objects", "derived_id", d.ContentID, "err", err)
-			continue
-		}
-
-		if len(objects) == 0 {
-			p.logger.Warn("no objects found for derived content", "derived_id", d.ContentID)
-			continue
-		}
-
-		// Determine content status based on object status
-		// If all objects are uploaded, derived content should be processed
-		allUploaded := true
-		for _, obj := range objects {
-			if obj.Status != string(simplecontent.ObjectStatusUploaded) {
-				allUploaded = false
-				break
-			}
-		}
-
-		// Update content status to match object status
-		// Derived content terminates at "processed" (not "uploaded")
-		targetStatus := simplecontent.ContentStatusCreated
-		if allUploaded {
-			targetStatus = simplecontent.ContentStatusProcessed
-		}
-
-		if derivedContent.Status != string(targetStatus) {
-			if err := p.svc.UpdateContentStatus(ctx, d.ContentID, targetStatus); err != nil {
-				p.logger.Warn("failed to update derived content status",
-					"derived_id", d.ContentID,
-					"target_status", targetStatus,
-					"err", err)
-				continue
-			}
-			derivedFixed++
-			p.statusUpdated++
-			p.logger.Info("updated derived content status",
-				"derived_id", d.ContentID,
-				"old_status", derivedContent.Status,
-				"new_status", targetStatus)
+	// Determine content status based on object status
+	// If all objects are uploaded, derived content should be processed
+	allUploaded := true
+	for _, obj := range objects {
+		if obj.Status != string(simplecontent.ObjectStatusUploaded) {
+			allUploaded = false
+			break
 		}
 	}
 
-	if derivedFixed > 0 {
-		p.logger.Info("fixed derived content status", "content_id", content.ID, "fixed_count", derivedFixed)
+	// Update content status to match object status
+	// Derived content terminates at "processed" (not "uploaded")
+	targetStatus := simplecontent.ContentStatusCreated
+	if allUploaded {
+		targetStatus = simplecontent.ContentStatusProcessed
+	}
+
+	if derivedContent.Status != string(targetStatus) {
+		if err := p.svc.UpdateContentStatus(ctx, derivedContent.ID, targetStatus); err != nil {
+			return fmt.Errorf("failed to update status: %w", err)
+		}
+		p.statusUpdated++
+		p.logger.Info("updated derived content status",
+			"content_id", derivedContent.ID,
+			"old_status", derivedContent.Status,
+			"new_status", targetStatus)
 	}
 
 	return nil
 }
 
 // Process implements scan.ContentProcessor
+// Processes derived content (thumbnails) to verify and fix status
 func (p *ThumbnailJobProcessor) Process(ctx context.Context, content *simplecontent.Content) error {
-	// Skip if not an image or is derived content
-	if content.DerivationType != "" {
-		p.logger.Debug("skipping derived content", "content_id", content.ID, "derivation_type", content.DerivationType)
+	// Only process derived content (thumbnails)
+	if content.DerivationType != "thumbnail" {
+		p.logger.Debug("skipping non-thumbnail content", "content_id", content.ID, "derivation_type", content.DerivationType)
 		return nil
 	}
 
-	// Check if it's an image
-	metadata, err := p.svc.GetContentMetadata(ctx, content.ID)
-	if err != nil {
-		return fmt.Errorf("get metadata: %w", err)
-	}
-
-	if !isImage(metadata.MimeType) {
-		p.skippedNonImage++
-		p.logger.Info("skipping non-image", "content_id", content.ID, "name", content.Name, "mime_type", metadata.MimeType)
-		return nil
-	}
-
-	// Check if thumbnails already exist
-	hasThumbnails, err := checkHasThumbnails(ctx, p.svc, content.ID, p.cfg.ThumbnailSizes)
-	if err != nil {
-		p.logger.Warn("failed to check existing thumbnails", "content_id", content.ID, "err", err)
-		// Continue processing to be safe
-		hasThumbnails = false
-	}
-
-	// If thumbnails exist and we should only process missing ones, skip
-	if p.cfg.OnlyMissingThumbs && hasThumbnails {
-		p.skippedHasThumbs++
-		p.logger.Info("skipping, all thumbnails exist", "content_id", content.ID, "name", content.Name)
-
-		// Fix derived content status if needed (independent of parent status)
-		if p.cfg.FixStatus {
-			if err := p.fixContentStatus(ctx, content); err != nil {
-				p.logger.Warn("failed to fix content status", "content_id", content.ID, "err", err)
-			}
-		}
-		return nil
-	}
-
-	// Publish job
-	if err := publishThumbnailJob(p.nc, p.cfg.JobSubject, content.ID, p.cfg.ThumbnailSizes); err != nil {
-		return fmt.Errorf("publish job: %w", err)
-	}
-
-	p.jobsPublished++
-	p.logger.Info("published thumbnail job", "content_id", content.ID, "name", content.Name, "jobs_published", p.jobsPublished)
-
-	// Small delay to avoid overwhelming the queue
-	time.Sleep(10 * time.Millisecond)
-
-	return nil
-}
-
-// checkHasThumbnails checks if all requested thumbnail sizes exist
-func checkHasThumbnails(ctx context.Context, svc simplecontent.Service, contentID uuid.UUID, sizesStr string) (bool, error) {
-	requestedSizes := parseSizes(sizesStr)
-
-	// Get existing thumbnails
-	existing, err := svc.ListDerivedContent(ctx,
-		simplecontent.WithParentID(contentID),
-		simplecontent.WithDerivationType("thumbnail"),
-	)
-	if err != nil {
-		return false, err
-	}
-
-	// Count unique thumbnail variants (ignoring the variant name format)
-	// Thumbnails can have variants like "thumbnail_small" or "thumbnail_300x225"
-	uniqueVariants := make(map[string]bool)
-	for _, derived := range existing {
-		if strings.HasPrefix(derived.Variant, "thumbnail_") {
-			uniqueVariants[derived.Variant] = true
-		}
-	}
-
-	// If we have at least as many thumbnail variants as requested sizes,
-	// assume all thumbnails exist (handles both naming conventions)
-	existingCount := len(uniqueVariants)
-	requestedCount := len(requestedSizes)
-
-	// Has all thumbnails if we have at least as many variants as requested
-	return existingCount >= requestedCount, nil
-}
-
-// publishThumbnailJob publishes a job to NATS for thumbnail generation
-func publishThumbnailJob(nc *bus.Client, subject string, contentID uuid.UUID, sizes string) error {
-	jobID := uuid.New().String()
-
-	job := contracts.Job{
-		JobID: jobID,
-		File: contracts.File{
-			ID: contentID.String(),
-			Attributes: map[string]interface{}{
-				"content_id": contentID.String(),
-			},
-		},
-		Hints: map[string]string{
-			"thumbnail_sizes": sizes,
-		},
-	}
-
-	// Wrap in CloudEvent format using helper
-	event, err := contracts.NewJobCloudEvent("backfill-command", job)
-	if err != nil {
-		return fmt.Errorf("create cloud event: %w", err)
-	}
-
-	// Publish using the bus client's PublishJSON method
-	if err := nc.PublishJSON(subject, event); err != nil {
-		return fmt.Errorf("publish to NATS: %w", err)
+	// Verify and fix status based on object verification
+	if err := p.fixDerivedContentStatus(ctx, content); err != nil {
+		p.logger.Warn("failed to fix derived content status", "content_id", content.ID, "err", err)
+		return err
 	}
 
 	return nil
-}
-
-func isImage(mimeType string) bool {
-	return strings.HasPrefix(mimeType, "image/")
-}
-
-func parseSizes(sizesStr string) []string {
-	if sizesStr == "" {
-		return []string{"small", "medium", "large"}
-	}
-	parts := strings.Split(sizesStr, ",")
-	var sizes []string
-	for _, p := range parts {
-		if s := strings.TrimSpace(p); s != "" {
-			sizes = append(sizes, s)
-		}
-	}
-	return sizes
 }
 
 func getenv(k, d string) string {
