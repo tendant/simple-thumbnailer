@@ -164,27 +164,38 @@ The backfill tool verifies and fixes status inconsistencies for derived content:
 │    → "created" = stuck waiting for download                 │
 │    → "processing" = stuck generating thumbnail              │
 │    → "uploaded" = old status needing migration              │
+│    → Note: "failed" status is EXCLUDED from backfill        │
 └─────────────────────────────────────────────────────────────┘
                            ↓
 ┌─────────────────────────────────────────────────────────────┐
-│ 2. Verify objects exist and are uploaded                    │
+│ 2. Check for timeout (created/processing only)              │
+│    → If status = "created" or "processing"                  │
+│    → Check time since last update (updated_at)              │
+│    → If > 1 hour: mark as "failed"                          │
+│    → Log timeout failure                                    │
+└─────────────────────────────────────────────────────────────┘
+                           ↓
+┌─────────────────────────────────────────────────────────────┐
+│ 3. Verify objects exist and are uploaded                    │
 │    → GetObjectsByContentID() for derived content            │
 │    → Check all objects have status = "uploaded"             │
 └─────────────────────────────────────────────────────────────┘
                            ↓
 ┌─────────────────────────────────────────────────────────────┐
-│ 3. Update derived content status based on verification      │
+│ 4. Update derived content status based on verification      │
 │    → If all objects uploaded: status = "processed"          │
-│    → If no objects: status = "created" (needs retry)        │
+│    → If no objects: keep current status (needs retry)       │
 │    → UpdateContentStatus() to correct status                │
 │    → Log status update                                      │
 └─────────────────────────────────────────────────────────────┘
 ```
 
 **Backfill Detection Scenarios:**
-- **Stuck at "created"**: Parent download never started or failed → retry job
-- **Stuck at "processing"**: Thumbnail generation crashed or timed out → retry job
+- **Stuck at "created" >1 hour**: Parent download failed or worker died → mark as "failed"
+- **Stuck at "processing" >1 hour**: Thumbnail generation crashed or timed out → mark as "failed"
 - **Status "uploaded"**: Old status from v0.1.21 or earlier → migrate to "processed"
+
+**Note:** Failed jobs are intentionally excluded from backfill scanning. Once a job is marked as "failed", it should be handled through a separate retry mechanism or manual intervention, not continuous backfill processing.
 
 ## Status State Machine Diagrams
 
@@ -355,8 +366,9 @@ CREATE TABLE content_derived (
    - Alert after N failures
 
 3. **Monitor stuck processing**
-   - Track items in `processing` state longer than threshold
-   - Alert on stale processing jobs
+   - Track items in `processing` or `created` state longer than threshold
+   - Backfill automatically marks jobs as `failed` after 1 hour timeout
+   - Alert on items stuck before timeout for investigation
 
 ## Monitoring Queries
 
@@ -407,6 +419,19 @@ WHERE c.derivation_type = 'thumbnail'
   AND c.status = 'processing'
   AND c.updated_at < NOW() - INTERVAL '10 minutes'
 ORDER BY c.updated_at ASC;
+```
+
+### Find failed jobs (for manual review/retry)
+```sql
+-- Derived content marked as "failed" - excluded from backfill, needs manual review
+SELECT c.id as content_id, cd.parent_id, c.status, c.updated_at,
+       EXTRACT(EPOCH FROM (NOW() - c.updated_at)) as seconds_since_failure,
+       cd.variant
+FROM content c
+JOIN content_derived cd ON c.id = cd.content_id
+WHERE c.derivation_type = 'thumbnail'
+  AND c.status = 'failed'
+ORDER BY c.updated_at DESC;
 ```
 
 ### Find status inconsistencies
@@ -468,20 +493,32 @@ WHERE c.status = 'processed'
 **Fix:** Manually update status if object exists and is uploaded
 
 ### Derived content stuck in 'created'
-**Symptom:** Derived content has status='created' for extended period
+**Symptom:** Derived content has status='created' for extended period (>10 minutes but <1 hour)
 **Cause:** Worker never downloaded parent, or job failed before download
 **Fix:**
 - Check parent content status (must be 'uploaded')
 - Check worker logs for download errors
-- Retry job or run backfill to detect and fix
+- Wait for backfill to detect and mark as 'failed' after 1 hour
+- Backfill will automatically mark as 'failed' if stuck >1 hour
 
 ### Derived content stuck in 'processing'
-**Symptom:** Derived content has status='processing' for extended period
+**Symptom:** Derived content has status='processing' for extended period (>10 minutes but <1 hour)
 **Cause:** Worker crashed during thumbnail generation, or generation timed out
 **Fix:**
 - Check worker logs for generation errors
 - Check disk space and memory limits
-- Retry job or run backfill to detect and fix
+- Wait for backfill to detect and mark as 'failed' after 1 hour
+- Backfill will automatically mark as 'failed' if stuck >1 hour
+
+### Derived content marked as 'failed'
+**Symptom:** Derived content has status='failed'
+**Cause:** Job was stuck in 'created' or 'processing' for >1 hour and marked as failed by backfill
+**Fix:**
+- Review worker logs to determine root cause
+- Fix underlying issue (network, disk space, etc.)
+- Manually update status back to 'created' to trigger retry
+- Or implement a retry mechanism to automatically retry failed jobs
+- **Note:** Failed jobs are excluded from backfill and require manual intervention
 
 ### Status mismatch: processed but no objects
 **Symptom:** content.status='processed' but no uploaded objects

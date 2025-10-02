@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/joho/godotenv"
@@ -127,12 +128,13 @@ func main() {
 
 	// Show detailed statistics when not in dry-run
 	if !cfg.DryRun && processor != nil {
-		statusUpdated := processor.Stats()
+		statusUpdated, statusFailed := processor.Stats()
 		logger.Info("backfill complete",
 			"total_found", result.TotalFound,
 			"processed", result.TotalProcessed,
 			"failed", result.TotalFailed,
 			"status_updated", statusUpdated,
+			"status_failed", statusFailed,
 		)
 	} else {
 		logger.Info("backfill complete",
@@ -214,10 +216,11 @@ func buildFilters(cfg config, logger *slog.Logger) admin.ContentFilters {
 	}
 
 	// Only process derived content that might need status fixing
-	// Target content that is created, processing, or uploaded (may need to be processed)
-	// "created" = waiting for parent download (potentially stuck)
-	// "processing" = parent downloaded, generating thumbnail (potentially stuck)
+	// Target content that is created, processing, or uploaded
+	// "created" = waiting for parent download (potentially stuck, will mark as failed if >1 hour)
+	// "processing" = parent downloaded, generating thumbnail (potentially stuck, will mark as failed if >1 hour)
 	// "uploaded" = old status before v0.1.22 (needs migration to "processed")
+	// Note: "failed" status is intentionally excluded - failed jobs should be handled separately via retry mechanism
 	filters.Statuses = []string{
 		string(simplecontent.ContentStatusCreated),
 		string(simplecontent.ContentStatusProcessing),
@@ -238,6 +241,7 @@ type ThumbnailJobProcessor struct {
 	cfg           config
 	logger        *slog.Logger
 	statusUpdated int
+	statusFailed  int
 }
 
 // NewThumbnailJobProcessor creates a new processor for verifying and fixing derived content status
@@ -251,13 +255,38 @@ func NewThumbnailJobProcessor(nc *bus.Client, svc simplecontent.Service, cfg con
 }
 
 // Stats returns statistics about the processing
-func (p *ThumbnailJobProcessor) Stats() (statusUpdated int) {
-	return p.statusUpdated
+func (p *ThumbnailJobProcessor) Stats() (statusUpdated, statusFailed int) {
+	return p.statusUpdated, p.statusFailed
 }
 
-// fixDerivedContentStatus fixes derived content status based on object status verification
+// fixDerivedContentStatus fixes derived content status based on timeout and object status verification
 // This ensures derived content status accurately reflects the actual state of underlying objects
 func (p *ThumbnailJobProcessor) fixDerivedContentStatus(ctx context.Context, derivedContent *simplecontent.Content) error {
+	currentStatus := derivedContent.Status
+
+	// Check if content is stuck in "created" or "processing" status for more than 1 hour
+	if currentStatus == string(simplecontent.ContentStatusCreated) || currentStatus == string(simplecontent.ContentStatusProcessing) {
+		stuckDuration := time.Since(derivedContent.UpdatedAt)
+		if stuckDuration > time.Hour {
+			p.logger.Warn("derived content stuck in status, marking as failed",
+				"content_id", derivedContent.ID,
+				"status", currentStatus,
+				"stuck_duration", stuckDuration.String())
+
+			// Mark as failed
+			if err := p.svc.UpdateContentStatus(ctx, derivedContent.ID, simplecontent.ContentStatusFailed); err != nil {
+				return fmt.Errorf("failed to update status to failed: %w", err)
+			}
+			p.statusFailed++
+			p.logger.Info("marked derived content as failed due to timeout",
+				"content_id", derivedContent.ID,
+				"old_status", currentStatus,
+				"new_status", "failed",
+				"stuck_duration", stuckDuration.String())
+			return nil
+		}
+	}
+
 	// Get objects to verify actual status
 	objects, err := p.svc.GetObjectsByContentID(ctx, derivedContent.ID)
 	if err != nil {
@@ -265,7 +294,14 @@ func (p *ThumbnailJobProcessor) fixDerivedContentStatus(ctx context.Context, der
 	}
 
 	if len(objects) == 0 {
-		p.logger.Warn("no objects found for derived content", "content_id", derivedContent.ID)
+		// No objects found - content is either waiting to be processed or truly stuck
+		// For "uploaded" status with no objects, this is an inconsistency
+		if currentStatus == string(simplecontent.ContentStatusUploaded) {
+			p.logger.Warn("no objects found for content in uploaded state",
+				"content_id", derivedContent.ID,
+				"status", currentStatus)
+		}
+		p.logger.Debug("no objects found for derived content", "content_id", derivedContent.ID, "status", currentStatus)
 		return nil
 	}
 
