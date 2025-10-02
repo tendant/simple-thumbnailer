@@ -182,11 +182,12 @@ func handleJob(ctx context.Context, job contracts.Job, cfg config, contentSvc si
 	}
 
 	state := &ProcessingState{
-		JobID:           job.JobID,
-		ParentContentID: contentID.String(),
-		ThumbnailSizes:  sizeNames,
-		StartTime:       time.Now(),
-		Lifecycle:       make([]schema.ThumbnailLifecycleEvent, 0),
+		JobID:             job.JobID,
+		ParentContentID:   contentID.String(),
+		ThumbnailSizes:    sizeNames,
+		DerivedContentIDs: make(map[string]uuid.UUID),
+		StartTime:         time.Now(),
+		Lifecycle:         make([]schema.ThumbnailLifecycleEvent, 0),
 	}
 
 	// Step 1: Get and validate parent content
@@ -210,7 +211,19 @@ func handleJob(ctx context.Context, job contracts.Job, cfg config, contentSvc si
 		return err
 	}
 
-	// Step 3: Fetch source
+	// Step 3: Create derived content placeholders before download
+	derivedContentIDs, err := createDerivedContentRecords(ctx, parent, thumbnailSizes, contentSvc, contentLogger)
+	if err != nil {
+		contentLogger.Error("create derived content records failed", "err", err)
+		failureType := classifyError(err)
+		state.AddLifecycleEvent(schema.StageFailed, err, failureType)
+		publishEventsStep(nc, cfg.ResultSubject, state, nil, sourcePath, err, failureType)
+		return fmt.Errorf("create derived content records: %w", err)
+	}
+	state.DerivedContentIDs = derivedContentIDs
+	contentLogger.Info("created derived content placeholders", "count", len(derivedContentIDs))
+
+	// Step 4: Fetch source
 	source, err := fetchSourceStep(ctx, contentID, uploader, contentLogger)
 	if err != nil {
 		failureType := classifyError(err)
@@ -224,10 +237,19 @@ func handleJob(ctx context.Context, job contracts.Job, cfg config, contentSvc si
 		}
 	}()
 
+	// Step 5: Update derived content status to "processing" after successful download
+	if err := updateDerivedContentStatusAfterDownload(ctx, state.DerivedContentIDs, contentSvc, contentLogger); err != nil {
+		contentLogger.Error("update derived content status failed", "err", err)
+		failureType := classifyError(err)
+		state.AddLifecycleEvent(schema.StageFailed, err, failureType)
+		publishEventsStep(nc, cfg.ResultSubject, state, nil, sourcePath, err, failureType)
+		return fmt.Errorf("update derived content status: %w", err)
+	}
+
 	state.AddLifecycleEvent(schema.StageProcessing, nil, "")
 	publishLifecycleEvent(nc, cfg.ResultSubject, state.Lifecycle[len(state.Lifecycle)-1])
 
-	// Step 4: Resolve filename
+	// Step 6: Resolve filename
 	name := job.File.Name
 	if name == "" && job.File.Attributes != nil {
 		if v, ok := job.File.Attributes["filename"].(string); ok && v != "" {
@@ -245,7 +267,7 @@ func handleJob(ctx context.Context, job contracts.Job, cfg config, contentSvc si
 	}
 	contentLogger.Info("resolved thumbnail filename", "name", name)
 
-	// Step 5: Generate thumbnails
+	// Step 7: Generate thumbnails
 	basePath := BuildThumbPath(cfg.ThumbDir, contentID.String(), name)
 	specs := make([]img.ThumbnailSpec, len(thumbnailSizes))
 	for i, size := range thumbnailSizes {
@@ -266,11 +288,11 @@ func handleJob(ctx context.Context, job contracts.Job, cfg config, contentSvc si
 	}
 	contentLogger.Info("thumbnails generated", "count", len(thumbnails))
 
-	// Step 6: Upload results
+	// Step 8: Upload results
 	state.AddLifecycleEvent(schema.StageUpload, nil, "")
 	publishLifecycleEvent(nc, cfg.ResultSubject, state.Lifecycle[len(state.Lifecycle)-1])
 
-	results, err := uploadResultsStep(ctx, parent, thumbnails, source, uploader, state, contentLogger)
+	results, err := uploadResultsStep(ctx, parent, thumbnails, source, uploader, state, contentSvc, contentLogger)
 	if err != nil {
 		failureType := classifyError(err)
 		state.AddLifecycleEvent(schema.StageFailed, err, failureType)
@@ -278,10 +300,67 @@ func handleJob(ctx context.Context, job contracts.Job, cfg config, contentSvc si
 		return err
 	}
 
-	// Step 7: Publish success event
+	// Step 9: Publish success event
 	state.AddLifecycleEvent(schema.StageCompleted, nil, "")
 	publishEventsStep(nc, cfg.ResultSubject, state, results, sourcePath, nil, "")
 	contentLogger.Info("completed job", "thumbnails", len(results), "processing_time_ms", state.GetProcessingDuration())
+	return nil
+}
+
+// createDerivedContentRecords creates placeholder records for each thumbnail size
+// before processing begins. This allows tracking of both download and generation phases.
+func createDerivedContentRecords(ctx context.Context, parent *simplecontent.Content, thumbnailSizes []SizeConfig, contentSvc simplecontent.Service, logger *slog.Logger) (map[string]uuid.UUID, error) {
+	derivedContentIDs := make(map[string]uuid.UUID, len(thumbnailSizes))
+
+	for _, size := range thumbnailSizes {
+		variant := deriveSizeVariant(size.Width, size.Height)
+		metadata := map[string]interface{}{
+			"width":  size.Width,
+			"height": size.Height,
+		}
+
+		derived, err := contentSvc.CreateDerivedContent(ctx, simplecontent.CreateDerivedContentRequest{
+			ParentID:       parent.ID,
+			OwnerID:        parent.OwnerID,
+			TenantID:       parent.TenantID,
+			DerivationType: "thumbnail",
+			Variant:        variant,
+			Metadata:       metadata,
+			InitialStatus:  simplecontent.ContentStatusCreated,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("create derived content for size %s: %w", size.Name, err)
+		}
+
+		derivedContentIDs[size.Name] = derived.ID
+		logger.Info("created derived content placeholder",
+			"size", size.Name,
+			"content_id", derived.ID,
+			"status", derived.Status)
+	}
+
+	return derivedContentIDs, nil
+}
+
+// deriveSizeVariant creates a variant string from width and height
+func deriveSizeVariant(width, height int) string {
+	if width == height {
+		return fmt.Sprintf("thumbnail_%d", width)
+	}
+	return fmt.Sprintf("thumbnail_%dx%d", width, height)
+}
+
+// updateDerivedContentStatusAfterDownload updates all derived content to "processing"
+// after the parent content has been successfully downloaded.
+func updateDerivedContentStatusAfterDownload(ctx context.Context, derivedContentIDs map[string]uuid.UUID, contentSvc simplecontent.Service, logger *slog.Logger) error {
+	for sizeName, contentID := range derivedContentIDs {
+		if err := contentSvc.UpdateContentStatus(ctx, contentID, simplecontent.ContentStatusProcessing); err != nil {
+			return fmt.Errorf("update status for size %s (content_id=%s): %w", sizeName, contentID, err)
+		}
+		logger.Info("updated derived content status to processing",
+			"size", sizeName,
+			"content_id", contentID)
+	}
 	return nil
 }
 
@@ -385,12 +464,13 @@ func parseThumbnailSizesHint(hints map[string]string, availableSizes []SizeConfi
 }
 
 type ProcessingState struct {
-	JobID           string
-	ParentContentID string
-	ParentStatus    string
-	ThumbnailSizes  []string
-	StartTime       time.Time
-	Lifecycle       []schema.ThumbnailLifecycleEvent
+	JobID              string
+	ParentContentID    string
+	ParentStatus       string
+	ThumbnailSizes     []string
+	DerivedContentIDs  map[string]uuid.UUID // size name -> derived content ID
+	StartTime          time.Time
+	Lifecycle          []schema.ThumbnailLifecycleEvent
 }
 
 func (ps *ProcessingState) AddLifecycleEvent(stage schema.ProcessingStage, err error, failureType schema.FailureType) {
@@ -511,13 +591,21 @@ func fetchSourceStep(ctx context.Context, contentID uuid.UUID, uploader *upload.
 	}, nil
 }
 
-func uploadResultsStep(ctx context.Context, parent *simplecontent.Content, thumbnails []img.ThumbnailOutput, source *SourceInfo, uploader *upload.Client, state *ProcessingState, logger *slog.Logger) ([]schema.ThumbnailResult, error) {
+func uploadResultsStep(ctx context.Context, parent *simplecontent.Content, thumbnails []img.ThumbnailOutput, source *SourceInfo, uploader *upload.Client, state *ProcessingState, contentSvc simplecontent.Service, logger *slog.Logger) ([]schema.ThumbnailResult, error) {
 	var results []schema.ThumbnailResult
 
 	for _, thumb := range thumbnails {
 		processingStart := time.Now()
 
-		result, err := uploader.UploadThumbnail(ctx, parent, thumb.Path, upload.UploadOptions{
+		// Get the derived content ID for this size
+		derivedContentID, ok := state.DerivedContentIDs[thumb.Name]
+		if !ok {
+			logger.Error("derived content ID not found for size", "size", thumb.Name)
+			return nil, fmt.Errorf("derived content ID not found for size %s", thumb.Name)
+		}
+
+		// Upload object for the existing derived content
+		_, err := uploader.UploadThumbnailObject(ctx, derivedContentID, thumb.Path, upload.UploadOptions{
 			FileName: source.Filename,
 			MimeType: source.MimeType,
 			Width:    thumb.Width,
@@ -548,6 +636,28 @@ func uploadResultsStep(ctx context.Context, parent *simplecontent.Content, thumb
 			continue
 		}
 
+		// Update status to "processed" after successful upload
+		if err := contentSvc.UpdateContentStatus(ctx, derivedContentID, simplecontent.ContentStatusProcessed); err != nil {
+			logger.Error("update content status to processed failed", "size", thumb.Name, "content_id", derivedContentID, "err", err)
+			// Continue with failed status but log the error
+			results = append(results, schema.ThumbnailResult{
+				Size:    thumb.Name,
+				Width:   thumb.Width,
+				Height:  thumb.Height,
+				Status:  "failed",
+				DerivationParams: &schema.DerivationParams{
+					SourceWidth:    thumb.SourceWidth,
+					SourceHeight:   thumb.SourceHeight,
+					TargetWidth:    thumb.Width,
+					TargetHeight:   thumb.Height,
+					Algorithm:      "lanczos",
+					ProcessingTime: processingTime,
+					GeneratedAt:    time.Now().Unix(),
+				},
+			})
+			continue
+		}
+
 		derivationParams := &schema.DerivationParams{
 			SourceWidth:    thumb.SourceWidth,
 			SourceHeight:   thumb.SourceHeight,
@@ -560,7 +670,7 @@ func uploadResultsStep(ctx context.Context, parent *simplecontent.Content, thumb
 
 		results = append(results, schema.ThumbnailResult{
 			Size:             thumb.Name,
-			ContentID:        result.Content.ID.String(),
+			ContentID:        derivedContentID.String(),
 			UploadURL:        "", // URL generation handled by content service
 			Width:            thumb.Width,
 			Height:           thumb.Height,
@@ -568,7 +678,7 @@ func uploadResultsStep(ctx context.Context, parent *simplecontent.Content, thumb
 			DerivationParams: derivationParams,
 		})
 
-		logger.Info("thumbnail uploaded successfully", "size", thumb.Name, "content_id", result.Content.ID, "processing_time_ms", processingTime)
+		logger.Info("thumbnail uploaded successfully", "size", thumb.Name, "content_id", derivedContentID, "processing_time_ms", processingTime)
 		os.Remove(thumb.Path)
 	}
 

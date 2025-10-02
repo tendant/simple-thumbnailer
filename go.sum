@@ -73,6 +73,8 @@ github.com/tendant/simple-content v0.1.21 h1:B7l8QBqL7KzU884+Z6OZW/IwlNR4NdoVJNS
 github.com/tendant/simple-content v0.1.21/go.mod h1:Sw4oBKS6yXKyUXzAIDxnssX8DqXj+B3B3wv3TTPDtLo=
 github.com/tendant/simple-content v0.1.22 h1:fTgfLclqpYW3w9/Kgywb+0c+KcfNPOfwDKAdoyMNchA=
 github.com/tendant/simple-content v0.1.22/go.mod h1:Sw4oBKS6yXKyUXzAIDxnssX8DqXj+B3B3wv3TTPDtLo=
+github.com/tendant/simple-content v0.1.23 h1:ivhiO1V6VoBG1HPsC7EBW1l/8JlJMC8YgYOevk5lyHQ=
+github.com/tendant/simple-content v0.1.23/go.mod h1:Sw4oBKS6yXKyUXzAIDxnssX8DqXj+B3B3wv3TTPDtLo=
 github.com/tendant/simple-process v0.0.4 h1:8+G4y/otDv0vkQbiKx6XWIITjTtQYXI5sWIKT4VwxCc=
 github.com/tendant/simple-process v0.0.4/go.mod h1:JokoiyKvBiHgVAX2UtVtsOjVGEhOuKh/YDopehDAYDo=
 golang.org/x/crypto v0.37.0 h1:kJNSjF/Xp7kU0iB2Z+9viTPMW4EqqsrywMXLJOOsXSE=

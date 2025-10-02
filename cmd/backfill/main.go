@@ -214,9 +214,13 @@ func buildFilters(cfg config, logger *slog.Logger) admin.ContentFilters {
 	}
 
 	// Only process derived content that might need status fixing
-	// Target content that is created or uploaded (may need to be processed)
+	// Target content that is created, processing, or uploaded (may need to be processed)
+	// "created" = waiting for parent download (potentially stuck)
+	// "processing" = parent downloaded, generating thumbnail (potentially stuck)
+	// "uploaded" = old status before v0.1.22 (needs migration to "processed")
 	filters.Statuses = []string{
 		string(simplecontent.ContentStatusCreated),
+		string(simplecontent.ContentStatusProcessing),
 		string(simplecontent.ContentStatusUploaded),
 	}
 

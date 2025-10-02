@@ -85,6 +85,7 @@ type UploadOptions struct {
 }
 
 // UploadThumbnail creates and uploads a thumbnail using the simplified UploadDerivedContent API.
+// DEPRECATED: Use UploadThumbnailObject for async workflows with pre-created content.
 func (c *Client) UploadThumbnail(ctx context.Context, parent *simplecontent.Content, thumbPath string, opts UploadOptions) (*UploadResult, error) {
 	info, err := os.Stat(thumbPath)
 	if err != nil {
@@ -136,6 +137,59 @@ func (c *Client) UploadThumbnail(ctx context.Context, parent *simplecontent.Cont
 	}
 
 	return &UploadResult{Content: derived}, nil
+}
+
+// UploadThumbnailObject uploads a thumbnail to pre-created derived content.
+// This is used for async workflows where content records are created before processing.
+func (c *Client) UploadThumbnailObject(ctx context.Context, contentID uuid.UUID, thumbPath string, opts UploadOptions) (*UploadResult, error) {
+	info, err := os.Stat(thumbPath)
+	if err != nil {
+		return nil, fmt.Errorf("stat thumbnail: %w", err)
+	}
+
+	fileName := opts.FileName
+	if fileName == "" {
+		fileName = filepath.Base(thumbPath)
+	}
+
+	mimeType := opts.MimeType
+	if mimeType == "" {
+		mt, err := detectMime(thumbPath)
+		if err != nil {
+			return nil, err
+		}
+		mimeType = mt
+	}
+
+	file, err := os.Open(thumbPath)
+	if err != nil {
+		return nil, fmt.Errorf("open thumbnail: %w", err)
+	}
+	defer file.Close()
+
+	// Upload object to existing derived content
+	obj, err := c.svc.UploadObjectForContent(ctx, simplecontent.UploadObjectForContentRequest{
+		ContentID:          contentID,
+		StorageBackendName: c.backend,
+		Reader:             file,
+		FileName:           fileName,
+		MimeType:           mimeType,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("upload object for content: %w", err)
+	}
+
+	// Get the content to return consistent result
+	content, err := c.svc.GetContent(ctx, contentID)
+	if err != nil {
+		return nil, fmt.Errorf("get content after upload: %w", err)
+	}
+
+	// Store filesize in object metadata if needed
+	_ = obj
+	_ = info
+
+	return &UploadResult{Content: content}, nil
 }
 
 func detectMime(path string) (string, error) {
