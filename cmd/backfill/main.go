@@ -13,7 +13,6 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/joho/godotenv"
 
 	simplecontent "github.com/tendant/simple-content/pkg/simplecontent"
@@ -83,17 +82,6 @@ func main() {
 
 	ctx := context.Background()
 
-	// Connect to database pool for direct SQL operations
-	var dbPool *pgxpool.Pool
-	if !cfg.DryRun && cfg.FixStatus {
-		dbPool, err = pgxpool.New(ctx, contentCfg.DatabaseURL)
-		if err != nil {
-			fatal(logger, "connect to database", err)
-		}
-		defer dbPool.Close()
-		logger.Info("connected to database for status fixing")
-	}
-
 	// Connect to NATS (skip if dry-run)
 	var nc *bus.Client
 	if !cfg.DryRun {
@@ -114,7 +102,7 @@ func main() {
 	// Create processor
 	var processor *ThumbnailJobProcessor
 	if !cfg.DryRun {
-		processor = NewThumbnailJobProcessor(nc, contentSvc, dbPool, cfg, logger)
+		processor = NewThumbnailJobProcessor(nc, contentSvc, repo, cfg, logger)
 	}
 
 	// Run scan
@@ -248,7 +236,7 @@ func buildFilters(cfg config, logger *slog.Logger) admin.ContentFilters {
 type ThumbnailJobProcessor struct {
 	nc              *bus.Client
 	svc             simplecontent.Service
-	dbPool          *pgxpool.Pool
+	repo            simplecontent.Repository
 	cfg             config
 	logger          *slog.Logger
 	jobsPublished   int
@@ -258,11 +246,11 @@ type ThumbnailJobProcessor struct {
 }
 
 // NewThumbnailJobProcessor creates a new processor for publishing thumbnail jobs
-func NewThumbnailJobProcessor(nc *bus.Client, svc simplecontent.Service, dbPool *pgxpool.Pool, cfg config, logger *slog.Logger) *ThumbnailJobProcessor {
+func NewThumbnailJobProcessor(nc *bus.Client, svc simplecontent.Service, repo simplecontent.Repository, cfg config, logger *slog.Logger) *ThumbnailJobProcessor {
 	return &ThumbnailJobProcessor{
 		nc:     nc,
 		svc:    svc,
-		dbPool: dbPool,
+		repo:   repo,
 		cfg:    cfg,
 		logger: logger,
 	}
@@ -329,18 +317,21 @@ func (p *ThumbnailJobProcessor) fixContentStatus(ctx context.Context, content *s
 	// that derived content generation is complete and verified
 	//
 	// Run this update whenever all derived content is uploaded, not just when we fixed content status
-	if allDerivedUploaded && p.dbPool != nil {
-		query := `UPDATE content.content_derived SET status = 'processed', updated_at = NOW()
-		          WHERE parent_id = $1 AND derivation_type = 'thumbnail' AND status != 'processed'`
-		result, err := p.dbPool.Exec(ctx, query, content.ID)
-		if err != nil {
-			p.logger.Warn("failed to update content_derived status", "content_id", content.ID, "err", err)
-		} else {
-			rowsAffected := result.RowsAffected()
-			if rowsAffected > 0 {
-				p.logger.Info("updated content_derived to processed",
-					"content_id", content.ID,
-					"rows_affected", rowsAffected)
+	if allDerivedUploaded {
+		// Update each derived content relationship status to 'processed'
+		processedStatus := string(simplecontent.ContentStatusProcessed)
+		for _, d := range derived {
+			if d.Status != processedStatus {
+				if err := p.repo.UpdateDerivedContentStatus(ctx, d.ContentID, processedStatus); err != nil {
+					p.logger.Warn("failed to update derived content status",
+						"content_id", content.ID,
+						"derived_id", d.ContentID,
+						"err", err)
+				} else {
+					p.logger.Info("updated derived content to processed",
+						"content_id", content.ID,
+						"derived_id", d.ContentID)
+				}
 			}
 		}
 	}
