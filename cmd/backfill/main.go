@@ -299,7 +299,7 @@ func (p *ThumbnailJobProcessor) fixContentStatus(ctx context.Context, content *s
 		}
 
 		// Determine content status based on object status
-		// If all objects are uploaded, content should be uploaded
+		// If all objects are uploaded, derived content should be processed
 		allUploaded := true
 		for _, obj := range objects {
 			if obj.Status != string(simplecontent.ObjectStatusUploaded) {
@@ -309,9 +309,10 @@ func (p *ThumbnailJobProcessor) fixContentStatus(ctx context.Context, content *s
 		}
 
 		// Update content status to match object status
+		// Derived content terminates at "processed" (not "uploaded")
 		targetStatus := simplecontent.ContentStatusCreated
 		if allUploaded {
-			targetStatus = simplecontent.ContentStatusUploaded
+			targetStatus = simplecontent.ContentStatusProcessed
 		}
 
 		if derivedContent.Status != string(targetStatus) {
@@ -371,8 +372,8 @@ func (p *ThumbnailJobProcessor) Process(ctx context.Context, content *simplecont
 		p.skippedHasThumbs++
 		p.logger.Info("skipping, all thumbnails exist", "content_id", content.ID, "name", content.Name)
 
-		// Fix status if needed: if content is "uploaded" and all thumbnails exist, mark as "processed"
-		if p.cfg.FixStatus && content.Status == string(simplecontent.ContentStatusUploaded) {
+		// Fix derived content status if needed (independent of parent status)
+		if p.cfg.FixStatus {
 			if err := p.fixContentStatus(ctx, content); err != nil {
 				p.logger.Warn("failed to fix content status", "content_id", content.ID, "err", err)
 			}

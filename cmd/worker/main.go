@@ -436,7 +436,7 @@ func publishEventsStep(nc *bus.Client, subject string, state *ProcessingState, r
 	totalFailed := 0
 
 	for _, result := range results {
-		if result.Status != "uploaded" {
+		if result.Status != "processed" {
 			totalFailed++
 		}
 	}
@@ -564,7 +564,7 @@ func uploadResultsStep(ctx context.Context, parent *simplecontent.Content, thumb
 			UploadURL:        "", // URL generation handled by content service
 			Width:            thumb.Width,
 			Height:           thumb.Height,
-			Status:           "uploaded",
+			Status:           "processed",
 			DerivationParams: derivationParams,
 		})
 
