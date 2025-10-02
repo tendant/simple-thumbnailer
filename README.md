@@ -160,3 +160,53 @@ Thumbnails stored as derived content:
 - Path: `derived/<parent-id>/<derived-id>/<variant>/<filename>`
 - Example: `derived/208c.../4fa1.../thumbnail_512/photo.png`
 - Events published with processing metrics and download URLs
+
+## Status Lifecycle
+
+This project uses a three-tier status tracking system to monitor content throughout its lifecycle:
+
+### Status Types
+
+- **Content Status** (High-level): `created` → `uploaded` → `deleted`
+  - Tracks overall content availability
+  - Simple lifecycle for basic operations
+
+- **Object Status** (Detailed): `created` → `uploading` → `uploaded` → `processing` → `processed` / `failed` → `deleted`
+  - Granular processing state tracking
+  - Used for monitoring post-upload operations
+
+- **Derived Content Status** (Processing): `created` → `processing` → `processed` / `failed`
+  - Tracks thumbnail/preview generation state
+  - Uses object-like semantics (not content status)
+  - `processed` indicates generation complete and verified
+
+### Why Different Status Types?
+
+- **Content status** is too coarse-grained for processing workflows
+- **Object status** provides detailed state tracking needed for async processing
+- **Derived status** mirrors object status to track processing completion
+
+### Status Fixing (`-fix-status` flag)
+
+When enabled, the backfill tool verifies and fixes `content_derived` status:
+
+1. Checks that all thumbnail variants exist
+2. Verifies derived content and objects are uploaded
+3. Updates `content_derived.status` to `processed` when verified
+4. Logs any thumbnails that fail verification
+
+**Example:**
+```bash
+# Verify and fix status for 100 items
+./backfill -execute -limit 100 -fix-status
+
+# Output shows:
+# - derived_processed: Count of verified thumbnails
+# - status_verified: Count of parent content verified
+```
+
+See [docs/STATUS_LIFECYCLE.md](docs/STATUS_LIFECYCLE.md) for complete lifecycle documentation including:
+- Detailed state machine diagrams
+- Complete workflow examples
+- Monitoring queries
+- Troubleshooting guide

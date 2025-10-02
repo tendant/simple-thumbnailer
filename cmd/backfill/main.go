@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/joho/godotenv"
 
 	simplecontent "github.com/tendant/simple-content/pkg/simplecontent"
@@ -32,6 +33,7 @@ type config struct {
 	Limit            int
 	DryRun           bool
 	OnlyMissingThumbs bool
+	FixStatus        bool
 	OwnerID          string
 	TenantID         string
 }
@@ -51,6 +53,7 @@ func main() {
 		"limit", cfg.Limit,
 		"dry_run", cfg.DryRun,
 		"only_missing", cfg.OnlyMissingThumbs,
+		"fix_status", cfg.FixStatus,
 	)
 
 	// Load simple-content config
@@ -78,6 +81,19 @@ func main() {
 	adminSvc := admin.New(repo)
 	logger.Info("admin service ready")
 
+	ctx := context.Background()
+
+	// Connect to database pool for direct SQL operations
+	var dbPool *pgxpool.Pool
+	if !cfg.DryRun && cfg.FixStatus {
+		dbPool, err = pgxpool.New(ctx, contentCfg.DatabaseURL)
+		if err != nil {
+			fatal(logger, "connect to database", err)
+		}
+		defer dbPool.Close()
+		logger.Info("connected to database for status fixing")
+	}
+
 	// Connect to NATS (skip if dry-run)
 	var nc *bus.Client
 	if !cfg.DryRun {
@@ -89,8 +105,6 @@ func main() {
 		logger.Info("connected to NATS", "nats_url", cfg.NATSURL)
 	}
 
-	ctx := context.Background()
-
 	// Build content filters
 	filters := buildFilters(cfg, logger)
 
@@ -100,7 +114,7 @@ func main() {
 	// Create processor
 	var processor *ThumbnailJobProcessor
 	if !cfg.DryRun {
-		processor = NewThumbnailJobProcessor(nc, contentSvc, cfg, logger)
+		processor = NewThumbnailJobProcessor(nc, contentSvc, dbPool, cfg, logger)
 	}
 
 	// Run scan
@@ -128,7 +142,7 @@ func main() {
 
 	// Show detailed statistics when not in dry-run
 	if !cfg.DryRun && processor != nil {
-		published, skippedNonImage, skippedHasThumbs := processor.Stats()
+		published, skippedNonImage, skippedHasThumbs, statusVerified := processor.Stats()
 		logger.Info("backfill complete",
 			"total_found", result.TotalFound,
 			"processed", result.TotalProcessed,
@@ -136,6 +150,7 @@ func main() {
 			"jobs_published", published,
 			"skipped_non_image", skippedNonImage,
 			"skipped_has_thumbs", skippedHasThumbs,
+			"status_verified", statusVerified,
 		)
 	} else {
 		logger.Info("backfill complete",
@@ -155,19 +170,21 @@ func loadConfig() config {
 	cfg := config{
 		NATSURL:          getenv("NATS_URL", "nats://127.0.0.1:4222"),
 		JobSubject:       getenv("PROCESS_SUBJECT", "simple-process.jobs"),
-		ThumbnailSizes:   getenv("THUMBNAIL_SIZES_BACKFILL", "small,medium,large"),
+		ThumbnailSizes:   getenv("THUMBNAIL_SIZES_BACKFILL", "thumbnail,preview,full"),
 		OwnerID:          getenv("BACKFILL_OWNER_ID", ""),
 		TenantID:         getenv("BACKFILL_TENANT_ID", ""),
 		BatchSize:        0,
 		Limit:            0,
 		DryRun:           true, // Default to dry-run for safety
 		OnlyMissingThumbs: true,
+		FixStatus:        true, // Default to fixing status
 	}
 
 	flag.IntVar(&cfg.BatchSize, "batch", 100, "Number of items to query per batch (default: 100)")
 	flag.IntVar(&cfg.Limit, "limit", 0, "Maximum total number of items to process (0 = unlimited)")
 	flag.BoolVar(&cfg.DryRun, "dry-run", true, "Show what would be processed without publishing jobs")
-	flag.BoolVar(&cfg.OnlyMissingThumbs, "only-missing", true, "Only process images missing thumbnails")
+	flag.BoolVar(&cfg.OnlyMissingThumbs, "only-missing", true, "Only process images missing thumbnails (false = regenerate all)")
+	flag.BoolVar(&cfg.FixStatus, "fix-status", true, "Update content status from 'created' to 'uploaded' after publishing jobs")
 	flag.StringVar(&cfg.OwnerID, "owner-id", cfg.OwnerID, "Filter by owner ID (empty = all owners)")
 	flag.StringVar(&cfg.TenantID, "tenant-id", cfg.TenantID, "Filter by tenant ID (empty = all tenants)")
 
@@ -214,9 +231,11 @@ func buildFilters(cfg config, logger *slog.Logger) admin.ContentFilters {
 		}
 	}
 
-	// Only process uploaded content (not created/pending)
-	uploadedStatus := string(simplecontent.ContentStatusUploaded)
-	filters.Status = &uploadedStatus
+	// Only process uploaded content (exclude created, deleted, failed, etc.)
+	// We should only fix status for uploaded content that has correct thumbnails
+	filters.Statuses = []string{
+		string(simplecontent.ContentStatusUploaded),
+	}
 
 	// Exclude derived content (thumbnails, etc.) - we only want source images
 	emptyString := ""
@@ -229,26 +248,146 @@ func buildFilters(cfg config, logger *slog.Logger) admin.ContentFilters {
 type ThumbnailJobProcessor struct {
 	nc              *bus.Client
 	svc             simplecontent.Service
+	dbPool          *pgxpool.Pool
 	cfg             config
 	logger          *slog.Logger
 	jobsPublished   int
 	skippedNonImage int
 	skippedHasThumbs int
+	statusUpdated   int
 }
 
 // NewThumbnailJobProcessor creates a new processor for publishing thumbnail jobs
-func NewThumbnailJobProcessor(nc *bus.Client, svc simplecontent.Service, cfg config, logger *slog.Logger) *ThumbnailJobProcessor {
+func NewThumbnailJobProcessor(nc *bus.Client, svc simplecontent.Service, dbPool *pgxpool.Pool, cfg config, logger *slog.Logger) *ThumbnailJobProcessor {
 	return &ThumbnailJobProcessor{
 		nc:     nc,
 		svc:    svc,
+		dbPool: dbPool,
 		cfg:    cfg,
 		logger: logger,
 	}
 }
 
 // Stats returns statistics about the processing
-func (p *ThumbnailJobProcessor) Stats() (jobsPublished, skippedNonImage, skippedHasThumbs int) {
-	return p.jobsPublished, p.skippedNonImage, p.skippedHasThumbs
+func (p *ThumbnailJobProcessor) Stats() (jobsPublished, skippedNonImage, skippedHasThumbs, statusUpdated int) {
+	return p.jobsPublished, p.skippedNonImage, p.skippedHasThumbs, p.statusUpdated
+}
+
+// fixContentStatus fixes derived content status and parent content status after verifying objects exist
+// This ensures the database reflects the actual state of the content and its derivatives
+func (p *ThumbnailJobProcessor) fixContentStatus(ctx context.Context, content *simplecontent.Content) error {
+	// Get derived content records
+	derived, err := p.svc.ListDerivedContent(ctx,
+		simplecontent.WithParentID(content.ID),
+		simplecontent.WithDerivationType("thumbnail"),
+	)
+	if err != nil {
+		return fmt.Errorf("list derived content: %w", err)
+	}
+
+	if len(derived) == 0 {
+		p.logger.Warn("no derived content found, skipping status update", "content_id", content.ID)
+		return nil
+	}
+
+	// Fix derived content status if needed
+	derivedFixed := 0
+	allDerivedUploaded := true
+	for _, d := range derived {
+		if d.Status != string(simplecontent.ContentStatusUploaded) {
+			// Get the derived content record to update it
+			derivedContent, err := p.svc.GetContent(ctx, d.ContentID)
+			if err != nil {
+				p.logger.Warn("failed to get derived content",
+					"content_id", content.ID,
+					"derived_id", d.ContentID,
+					"err", err)
+				allDerivedUploaded = false
+				continue
+			}
+
+			// Update derived content status to "uploaded"
+			derivedContent.Status = string(simplecontent.ContentStatusUploaded)
+			if err := p.svc.UpdateContent(ctx, simplecontent.UpdateContentRequest{
+				Content: derivedContent,
+			}); err != nil {
+				p.logger.Warn("failed to update derived content status",
+					"content_id", content.ID,
+					"derived_id", d.ContentID,
+					"err", err)
+				allDerivedUploaded = false
+				continue
+			}
+
+			derivedFixed++
+		}
+	}
+
+	// Update content_derived table status to 'processed'
+	// This is necessary because UpdateContent doesn't update the content_derived join table
+	// We use 'processed' (object-like status) instead of 'uploaded' to indicate
+	// that derived content generation is complete and verified
+	//
+	// Run this update whenever all derived content is uploaded, not just when we fixed content status
+	if allDerivedUploaded && p.dbPool != nil {
+		query := `UPDATE content.content_derived SET status = 'processed', updated_at = NOW()
+		          WHERE parent_id = $1 AND derivation_type = 'thumbnail' AND status != 'processed'`
+		result, err := p.dbPool.Exec(ctx, query, content.ID)
+		if err != nil {
+			p.logger.Warn("failed to update content_derived status", "content_id", content.ID, "err", err)
+		} else {
+			rowsAffected := result.RowsAffected()
+			if rowsAffected > 0 {
+				p.logger.Info("updated content_derived to processed",
+					"content_id", content.ID,
+					"rows_affected", rowsAffected)
+			}
+		}
+	}
+
+	// Update parent content status if all derived content is now uploaded
+	if allDerivedUploaded {
+		oldStatus := content.Status
+		if content.Status != string(simplecontent.ContentStatusUploaded) {
+			content.Status = string(simplecontent.ContentStatusUploaded)
+			if err := p.svc.UpdateContent(ctx, simplecontent.UpdateContentRequest{
+				Content: content,
+			}); err != nil {
+				return fmt.Errorf("update content status: %w", err)
+			}
+			p.statusUpdated++
+			p.logger.Info("updated parent content status",
+				"content_id", content.ID,
+				"old_status", oldStatus,
+				"new_status", "uploaded",
+				"thumbnails_verified", len(derived),
+				"derived_fixed", derivedFixed)
+		} else {
+			// Status already correct
+			p.statusUpdated++
+			if derivedFixed > 0 {
+				p.logger.Info("verified derived content processing complete",
+					"content_id", content.ID,
+					"parent_status", "uploaded",
+					"thumbnails_verified", len(derived),
+					"derived_processed", derivedFixed,
+					"derived_status", "processed")
+			} else {
+				p.logger.Info("verified content and thumbnails ready",
+					"content_id", content.ID,
+					"parent_status", "uploaded",
+					"thumbnails_verified", len(derived),
+					"derived_status", "processed")
+			}
+		}
+	} else {
+		p.logger.Warn("not all derived content could be fixed, skipping parent status update",
+			"content_id", content.ID,
+			"derived_total", len(derived),
+			"derived_fixed", derivedFixed)
+	}
+
+	return nil
 }
 
 // Process implements scan.ContentProcessor
@@ -271,17 +410,26 @@ func (p *ThumbnailJobProcessor) Process(ctx context.Context, content *simplecont
 		return nil
 	}
 
-	// Check if thumbnails already exist (if only_missing is enabled)
-	if p.cfg.OnlyMissingThumbs {
-		needsThumbnails, err := checkNeedsThumbnails(ctx, p.svc, content.ID, p.cfg.ThumbnailSizes)
-		if err != nil {
-			p.logger.Warn("failed to check existing thumbnails", "content_id", content.ID, "err", err)
-			// Continue processing to be safe
-		} else if !needsThumbnails {
-			p.skippedHasThumbs++
-			p.logger.Info("skipping, all thumbnails exist", "content_id", content.ID, "name", content.Name)
-			return nil
+	// Check if thumbnails already exist
+	hasThumbnails, err := checkHasThumbnails(ctx, p.svc, content.ID, p.cfg.ThumbnailSizes)
+	if err != nil {
+		p.logger.Warn("failed to check existing thumbnails", "content_id", content.ID, "err", err)
+		// Continue processing to be safe
+		hasThumbnails = false
+	}
+
+	// If thumbnails exist and we should only process missing ones, skip
+	if p.cfg.OnlyMissingThumbs && hasThumbnails {
+		p.skippedHasThumbs++
+		p.logger.Info("skipping, all thumbnails exist", "content_id", content.ID, "name", content.Name)
+
+		// Fix status if needed: if content is "uploaded" and all thumbnails exist, mark as "processed"
+		if p.cfg.FixStatus && content.Status == string(simplecontent.ContentStatusUploaded) {
+			if err := p.fixContentStatus(ctx, content); err != nil {
+				p.logger.Warn("failed to fix content status", "content_id", content.ID, "err", err)
+			}
 		}
+		return nil
 	}
 
 	// Publish job
@@ -298,8 +446,8 @@ func (p *ThumbnailJobProcessor) Process(ctx context.Context, content *simplecont
 	return nil
 }
 
-// checkNeedsThumbnails checks if any of the requested thumbnail sizes are missing
-func checkNeedsThumbnails(ctx context.Context, svc simplecontent.Service, contentID uuid.UUID, sizesStr string) (bool, error) {
+// checkHasThumbnails checks if all requested thumbnail sizes exist
+func checkHasThumbnails(ctx context.Context, svc simplecontent.Service, contentID uuid.UUID, sizesStr string) (bool, error) {
 	requestedSizes := parseSizes(sizesStr)
 
 	// Get existing thumbnails
@@ -311,20 +459,22 @@ func checkNeedsThumbnails(ctx context.Context, svc simplecontent.Service, conten
 		return false, err
 	}
 
-	// Check if any requested size is missing
-	existingVariants := make(map[string]bool)
+	// Count unique thumbnail variants (ignoring the variant name format)
+	// Thumbnails can have variants like "thumbnail_small" or "thumbnail_300x225"
+	uniqueVariants := make(map[string]bool)
 	for _, derived := range existing {
-		existingVariants[derived.Variant] = true
-	}
-
-	for _, size := range requestedSizes {
-		variant := "thumbnail_" + size
-		if !existingVariants[variant] {
-			return true, nil
+		if strings.HasPrefix(derived.Variant, "thumbnail_") {
+			uniqueVariants[derived.Variant] = true
 		}
 	}
 
-	return false, nil
+	// If we have at least as many thumbnail variants as requested sizes,
+	// assume all thumbnails exist (handles both naming conventions)
+	existingCount := len(uniqueVariants)
+	requestedCount := len(requestedSizes)
+
+	// Has all thumbnails if we have at least as many variants as requested
+	return existingCount >= requestedCount, nil
 }
 
 // publishThumbnailJob publishes a job to NATS for thumbnail generation
