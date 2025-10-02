@@ -7,10 +7,9 @@ toolchain go1.24.7
 require (
 	github.com/disintegration/imaging v1.6.2
 	github.com/google/uuid v1.6.0
-	github.com/jackc/pgx/v5 v5.7.5
 	github.com/joho/godotenv v1.5.1
 	github.com/nats-io/nats.go v1.45.0
-	github.com/tendant/simple-content v0.1.19
+	github.com/tendant/simple-content v0.1.21
 	github.com/tendant/simple-process v0.0.4
 )
 
@@ -36,6 +35,7 @@ require (
 	github.com/aws/smithy-go v1.23.0 // indirect
 	github.com/jackc/pgpassfile v1.0.0 // indirect
 	github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 // indirect
+	github.com/jackc/pgx/v5 v5.7.5 // indirect
 	github.com/jackc/puddle/v2 v2.2.2 // indirect
 	github.com/klauspost/compress v1.18.0 // indirect
 	github.com/nats-io/nkeys v0.4.11 // indirect

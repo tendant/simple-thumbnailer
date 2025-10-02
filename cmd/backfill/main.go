@@ -72,7 +72,7 @@ func main() {
 	}
 	logger.Info("simplecontent service ready")
 
-	// Build admin service
+	// Build admin service and repository
 	repo, err := contentCfg.BuildRepository()
 	if err != nil {
 		fatal(logger, "build repository", err)
@@ -102,7 +102,7 @@ func main() {
 	// Create processor
 	var processor *ThumbnailJobProcessor
 	if !cfg.DryRun {
-		processor = NewThumbnailJobProcessor(nc, contentSvc, repo, cfg, logger)
+		processor = NewThumbnailJobProcessor(nc, contentSvc, cfg, logger)
 	}
 
 	// Run scan
@@ -236,7 +236,6 @@ func buildFilters(cfg config, logger *slog.Logger) admin.ContentFilters {
 type ThumbnailJobProcessor struct {
 	nc              *bus.Client
 	svc             simplecontent.Service
-	repo            simplecontent.Repository
 	cfg             config
 	logger          *slog.Logger
 	jobsPublished   int
@@ -246,11 +245,10 @@ type ThumbnailJobProcessor struct {
 }
 
 // NewThumbnailJobProcessor creates a new processor for publishing thumbnail jobs
-func NewThumbnailJobProcessor(nc *bus.Client, svc simplecontent.Service, repo simplecontent.Repository, cfg config, logger *slog.Logger) *ThumbnailJobProcessor {
+func NewThumbnailJobProcessor(nc *bus.Client, svc simplecontent.Service, cfg config, logger *slog.Logger) *ThumbnailJobProcessor {
 	return &ThumbnailJobProcessor{
 		nc:     nc,
 		svc:    svc,
-		repo:   repo,
 		cfg:    cfg,
 		logger: logger,
 	}
@@ -261,10 +259,10 @@ func (p *ThumbnailJobProcessor) Stats() (jobsPublished, skippedNonImage, skipped
 	return p.jobsPublished, p.skippedNonImage, p.skippedHasThumbs, p.statusUpdated
 }
 
-// fixContentStatus fixes derived content status and parent content status after verifying objects exist
-// This ensures the database reflects the actual state of the content and its derivatives
+// fixContentStatus fixes derived content status based on object status verification
+// This ensures content status accurately reflects the actual state of underlying objects
 func (p *ThumbnailJobProcessor) fixContentStatus(ctx context.Context, content *simplecontent.Content) error {
-	// Get derived content records
+	// Get derived content relationships
 	derived, err := p.svc.ListDerivedContent(ctx,
 		simplecontent.WithParentID(content.ID),
 		simplecontent.WithDerivationType("thumbnail"),
@@ -274,108 +272,67 @@ func (p *ThumbnailJobProcessor) fixContentStatus(ctx context.Context, content *s
 	}
 
 	if len(derived) == 0 {
-		p.logger.Warn("no derived content found, skipping status update", "content_id", content.ID)
+		p.logger.Warn("no derived content found", "content_id", content.ID)
 		return nil
 	}
 
-	// Fix derived content status if needed
+	// Fix derived content status based on object status
 	derivedFixed := 0
-	allDerivedUploaded := true
 	for _, d := range derived {
-		if d.Status != string(simplecontent.ContentStatusUploaded) {
-			// Get the derived content record to update it
-			derivedContent, err := p.svc.GetContent(ctx, d.ContentID)
-			if err != nil {
-				p.logger.Warn("failed to get derived content",
-					"content_id", content.ID,
-					"derived_id", d.ContentID,
-					"err", err)
-				allDerivedUploaded = false
-				continue
-			}
+		// Get actual content record
+		derivedContent, err := p.svc.GetContent(ctx, d.ContentID)
+		if err != nil {
+			p.logger.Warn("failed to get derived content", "derived_id", d.ContentID, "err", err)
+			continue
+		}
 
-			// Update derived content status to "uploaded"
-			derivedContent.Status = string(simplecontent.ContentStatusUploaded)
-			if err := p.svc.UpdateContent(ctx, simplecontent.UpdateContentRequest{
-				Content: derivedContent,
-			}); err != nil {
+		// Get objects to verify actual status
+		objects, err := p.svc.GetObjectsByContentID(ctx, d.ContentID)
+		if err != nil {
+			p.logger.Warn("failed to get objects", "derived_id", d.ContentID, "err", err)
+			continue
+		}
+
+		if len(objects) == 0 {
+			p.logger.Warn("no objects found for derived content", "derived_id", d.ContentID)
+			continue
+		}
+
+		// Determine content status based on object status
+		// If all objects are uploaded, content should be uploaded
+		allUploaded := true
+		for _, obj := range objects {
+			if obj.Status != string(simplecontent.ObjectStatusUploaded) {
+				allUploaded = false
+				break
+			}
+		}
+
+		// Update content status to match object status
+		targetStatus := simplecontent.ContentStatusCreated
+		if allUploaded {
+			targetStatus = simplecontent.ContentStatusUploaded
+		}
+
+		if derivedContent.Status != string(targetStatus) {
+			if err := p.svc.UpdateContentStatus(ctx, d.ContentID, targetStatus); err != nil {
 				p.logger.Warn("failed to update derived content status",
-					"content_id", content.ID,
 					"derived_id", d.ContentID,
+					"target_status", targetStatus,
 					"err", err)
-				allDerivedUploaded = false
 				continue
 			}
-
 			derivedFixed++
+			p.statusUpdated++
+			p.logger.Info("updated derived content status",
+				"derived_id", d.ContentID,
+				"old_status", derivedContent.Status,
+				"new_status", targetStatus)
 		}
 	}
 
-	// Update content_derived table status to 'processed'
-	// This is necessary because UpdateContent doesn't update the content_derived join table
-	// We use 'processed' (object-like status) instead of 'uploaded' to indicate
-	// that derived content generation is complete and verified
-	//
-	// Run this update whenever all derived content is uploaded, not just when we fixed content status
-	if allDerivedUploaded {
-		// Update each derived content relationship status to 'processed'
-		processedStatus := string(simplecontent.ContentStatusProcessed)
-		for _, d := range derived {
-			if d.Status != processedStatus {
-				if err := p.repo.UpdateDerivedContentStatus(ctx, d.ContentID, processedStatus); err != nil {
-					p.logger.Warn("failed to update derived content status",
-						"content_id", content.ID,
-						"derived_id", d.ContentID,
-						"err", err)
-				} else {
-					p.logger.Info("updated derived content to processed",
-						"content_id", content.ID,
-						"derived_id", d.ContentID)
-				}
-			}
-		}
-	}
-
-	// Update parent content status if all derived content is now uploaded
-	if allDerivedUploaded {
-		oldStatus := content.Status
-		if content.Status != string(simplecontent.ContentStatusUploaded) {
-			content.Status = string(simplecontent.ContentStatusUploaded)
-			if err := p.svc.UpdateContent(ctx, simplecontent.UpdateContentRequest{
-				Content: content,
-			}); err != nil {
-				return fmt.Errorf("update content status: %w", err)
-			}
-			p.statusUpdated++
-			p.logger.Info("updated parent content status",
-				"content_id", content.ID,
-				"old_status", oldStatus,
-				"new_status", "uploaded",
-				"thumbnails_verified", len(derived),
-				"derived_fixed", derivedFixed)
-		} else {
-			// Status already correct
-			p.statusUpdated++
-			if derivedFixed > 0 {
-				p.logger.Info("verified derived content processing complete",
-					"content_id", content.ID,
-					"parent_status", "uploaded",
-					"thumbnails_verified", len(derived),
-					"derived_processed", derivedFixed,
-					"derived_status", "processed")
-			} else {
-				p.logger.Info("verified content and thumbnails ready",
-					"content_id", content.ID,
-					"parent_status", "uploaded",
-					"thumbnails_verified", len(derived),
-					"derived_status", "processed")
-			}
-		}
-	} else {
-		p.logger.Warn("not all derived content could be fixed, skipping parent status update",
-			"content_id", content.ID,
-			"derived_total", len(derived),
-			"derived_fixed", derivedFixed)
+	if derivedFixed > 0 {
+		p.logger.Info("fixed derived content status", "content_id", content.ID, "fixed_count", derivedFixed)
 	}
 
 	return nil
