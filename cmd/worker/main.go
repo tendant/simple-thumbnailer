@@ -278,7 +278,16 @@ func handleJob(ctx context.Context, job contracts.Job, cfg config, contentSvc si
 		}
 	}
 
-	thumbnails, err := img.GenerateThumbnails(source.Path, basePath, specs)
+	// Get MIME type and select appropriate generator
+	generator, err := img.GetGenerator(source.MimeType)
+	if err != nil {
+		contentLogger.Warn("unsupported file type, falling back to image generator", "mime_type", source.MimeType, "err", err)
+		// Fallback to image generator for backward compatibility
+		generator = &img.ImageGenerator{}
+	}
+	contentLogger.Info("using generator", "generator", generator.Name(), "mime_type", source.MimeType)
+
+	thumbnails, err := generator.Generate(ctx, source.Path, basePath, specs)
 	if err != nil {
 		contentLogger.Error("thumbnail generation failed", "err", err)
 		failureType := classifyError(err)
@@ -286,7 +295,7 @@ func handleJob(ctx context.Context, job contracts.Job, cfg config, contentSvc si
 		publishEventsStep(nc, cfg.ResultSubject, state, nil, sourcePath, err, failureType)
 		return fmt.Errorf("generate thumbnails: %w", err)
 	}
-	contentLogger.Info("thumbnails generated", "count", len(thumbnails))
+	contentLogger.Info("thumbnails generated", "count", len(thumbnails), "generator", generator.Name())
 
 	// Step 8: Upload results
 	state.AddLifecycleEvent(schema.StageUpload, nil, "")

@@ -1,26 +1,73 @@
-# Image Thumbnailer
+# Multi-Format Thumbnailer
 
-A Go worker that generates multiple thumbnail sizes from images using NATS job processing.
+A Go worker that generates multiple thumbnail sizes from images, videos, and PDFs using NATS job processing.
 
 **Features:**
 - Consumes jobs from NATS with simple-process protocol
-- Downloads source images from simple-content storage
+- Downloads source content from simple-content storage
 - Generates multiple thumbnail sizes in parallel
 - Uploads results as derived content with metadata
 - Publishes lifecycle events for monitoring
+- **NEW:** Supports videos (FFmpeg), PDFs (Poppler), and images
 
-**Stack:** Go + NATS + simple-process + simple-content + imaging
+**Stack:** Go + NATS + simple-process + simple-content + imaging + FFmpeg + Poppler
+
+## Supported Formats
+
+| Format | Tool | Performance | Notes |
+|--------|------|-------------|-------|
+| Images (JPEG, PNG, GIF, WebP) | imaging library | ~50ms | All common formats |
+| Videos (MP4, MOV, AVI, MKV, etc.) | FFmpeg | ~130ms | Smart frame selection |
+| PDFs | Poppler | ~20ms | First page only |
 
 ## Development
 
-```bash
-# Build and test
-go build -tags nats ./cmd/worker
-go build -tags nats ./cmd/backfill
-go test -tags nats ./...  # Run all tests
-go test ./...             # Run tests without NATS worker
+### Prerequisites
 
-# Run
+For local development, install conversion tools:
+
+```bash
+# macOS
+./scripts/install-tools.sh
+# or manually: brew install ffmpeg poppler
+
+# Ubuntu/Debian
+sudo apt-get install ffmpeg poppler-utils
+
+# Verify installation
+ffmpeg -version
+pdftoppm -v
+```
+
+### Build and Test
+
+```bash
+# Build worker
+go build -tags nats ./cmd/worker
+
+# Build backfill tool
+go build -tags nats ./cmd/backfill
+
+# Build standalone converter test tool
+go build -o test-convert ./cmd/test-convert
+
+# Run all tests
+go test ./...
+
+# Run tests including real file conversion
+go test -v ./internal/img
+
+# Test conversion tools standalone
+./test-convert -input scripts/test-samples/sample.mp4 -output /tmp/thumb.jpg
+./test-convert -input scripts/test-samples/sample.pdf -output /tmp/thumb.png
+
+# Run all format tests
+./scripts/test-all-formats.sh
+```
+
+### Run Worker
+
+```bash
 cp .env.sample .env
 docker compose up -d
 make run-worker
