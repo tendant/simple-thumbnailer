@@ -562,11 +562,12 @@ func (e ValidationError) Error() string {
 
 func validateParentContentStep(ctx context.Context, parent *simplecontent.Content, contentSvc simplecontent.Service, logger *slog.Logger) error {
 	// Check parent content status
-	if parent.Status != string(simplecontent.ContentStatusUploaded) {
-		logger.Warn("parent content not ready for derivation", "status", parent.Status, "required", "uploaded")
+	requiredStatus := simplecontent.ContentStatusUploaded
+	if parent.Status != string(requiredStatus) {
+		logger.Warn("parent content not ready for derivation", "status", parent.Status, "required", requiredStatus)
 		return ValidationError{
 			Type:    schema.FailureTypeValidation,
-			Message: fmt.Sprintf("parent content status is '%s', expected 'uploaded'", parent.Status),
+			Message: fmt.Sprintf("parent content status is '%s', expected '%s'", parent.Status, requiredStatus),
 		}
 	}
 
@@ -679,7 +680,9 @@ func uploadResultsStep(ctx context.Context, parent *simplecontent.Content, thumb
 		})
 
 		logger.Info("thumbnail uploaded successfully", "size", thumb.Name, "content_id", derivedContentID, "processing_time_ms", processingTime)
-		os.Remove(thumb.Path)
+		if err := os.Remove(thumb.Path); err != nil {
+			logger.Warn("failed to cleanup thumbnail file", "path", thumb.Path, "err", err)
+		}
 	}
 
 	return results, nil

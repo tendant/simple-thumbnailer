@@ -86,6 +86,10 @@ type UploadOptions struct {
 
 // UploadThumbnail creates and uploads a thumbnail using the simplified UploadDerivedContent API.
 // DEPRECATED: Use UploadThumbnailObject for async workflows with pre-created content.
+// This method will be removed in v2.0.0. For new code, use the async workflow:
+// 1. CreateDerivedContent to create placeholder
+// 2. Generate thumbnail
+// 3. UploadThumbnailObject to upload to existing content
 func (c *Client) UploadThumbnail(ctx context.Context, parent *simplecontent.Content, thumbPath string, opts UploadOptions) (*UploadResult, error) {
 	info, err := os.Stat(thumbPath)
 	if err != nil {

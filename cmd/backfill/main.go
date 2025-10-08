@@ -216,15 +216,16 @@ func buildFilters(cfg config, logger *slog.Logger) admin.ContentFilters {
 	}
 
 	// Only process derived content that might need status fixing
-	// Target content that is created, processing, or uploaded
+	// Target content that is created, processing, or uploaded (legacy)
 	// "created" = waiting for parent download (potentially stuck, will mark as failed if >1 hour)
 	// "processing" = parent downloaded, generating thumbnail (potentially stuck, will mark as failed if >1 hour)
-	// "uploaded" = old status before v0.1.22 (needs migration to "processed")
+	// "uploaded" = LEGACY status from pre-v0.1.22 that needs migration to "processed"
+	//              (derived content should use "processed" as terminal state, not "uploaded")
 	// Note: "failed" status is intentionally excluded - failed jobs should be handled separately via retry mechanism
 	filters.Statuses = []string{
 		string(simplecontent.ContentStatusCreated),
 		string(simplecontent.ContentStatusProcessing),
-		string(simplecontent.ContentStatusUploaded),
+		string(simplecontent.ContentStatusUploaded), // Legacy status - will be migrated to "processed"
 	}
 
 	// Only process derived content (thumbnails) - backfill is for derived content only
@@ -295,9 +296,10 @@ func (p *ThumbnailJobProcessor) fixDerivedContentStatus(ctx context.Context, der
 
 	if len(objects) == 0 {
 		// No objects found - content is either waiting to be processed or truly stuck
-		// For "uploaded" status with no objects, this is an inconsistency
-		if currentStatus == string(simplecontent.ContentStatusUploaded) {
-			p.logger.Warn("no objects found for content in uploaded state",
+		// For "processed" status with no objects, this is an inconsistency
+		// Note: Derived content should never be in "uploaded" state - it transitions from processing → processed
+		if currentStatus == string(simplecontent.ContentStatusProcessed) {
+			p.logger.Warn("no objects found for content in processed state",
 				"content_id", derivedContent.ID,
 				"status", currentStatus)
 		}
