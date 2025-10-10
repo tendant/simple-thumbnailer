@@ -45,48 +45,46 @@ type config struct {
 	ThumbnailSizes []SizeConfig
 }
 
-func loadSimpleContentConfig() (*simpleconfig.ServiceConfig, error) {
-	// Build ServiceConfig manually with explicit endpoint configuration
-	// This ensures MinIO/S3 endpoint is properly configured
-	cfg := &simpleconfig.ServiceConfig{
-		DatabaseURL:           getenv("DATABASE_URL", ""),
-		DatabaseType:          getenv("DATABASE_TYPE", "postgres"),
-		DBSchema:              getenv("DATABASE_SCHEMA", "content"),
-		DefaultStorageBackend: getenv("DEFAULT_STORAGE_BACKEND", "s3"),
-		EnableEventLogging:    false,
-		EnablePreviews:        true,
-		URLStrategy:           "storage-delegated",
+func loadSimpleContentConfig() (*simpleconfig.ServerConfig, error) {
+	opts := []simpleconfig.Option{
+		simpleconfig.WithDatabase(getenv("DATABASE_TYPE", "postgres"), getenv("DATABASE_URL", "")),
+		simpleconfig.WithDatabaseSchema(getenv("DATABASE_SCHEMA", "content")),
+		simpleconfig.WithDefaultStorage(getenv("DEFAULT_STORAGE_BACKEND", "s3")),
 	}
 
-	// Configure S3 storage backend with explicit endpoint
-	if cfg.DefaultStorageBackend == "s3" {
-		cfg.StorageBackends = []simpleconfig.StorageBackendConfig{
-			{
-				Name: "s3",
-				Type: "s3",
-				Config: map[string]interface{}{
-					"region":            getenv("AWS_S3_REGION", "us-east-1"),
-					"bucket":            getenv("AWS_S3_BUCKET", "xchangeai-content"),
-					"access_key_id":     getenv("AWS_ACCESS_KEY_ID", ""),
-					"secret_access_key": getenv("AWS_SECRET_ACCESS_KEY", ""),
-					"endpoint":          getenv("AWS_S3_ENDPOINT", ""),
-					"use_ssl":           getenv("AWS_S3_USE_SSL", "false") == "true",
-					"use_path_style":    getenv("AWS_S3_USE_PATH_STYLE", "true") == "true",
-					"presign_duration":  3600,
-				},
-			},
-		}
-	} else if cfg.DefaultStorageBackend == "memory" {
-		cfg.StorageBackends = []simpleconfig.StorageBackendConfig{
-			{
-				Name:   "memory",
-				Type:   "memory",
-				Config: map[string]interface{}{},
-			},
-		}
+	// Configure storage backend
+	switch getenv("DEFAULT_STORAGE_BACKEND", "s3") {
+	case "s3":
+		opts = append(opts, simpleconfig.WithS3StorageFull(
+			"s3",
+			getenv("AWS_S3_BUCKET", "xchangeai-content"),
+			getenv("AWS_S3_REGION", "us-east-1"),
+			getenv("AWS_ACCESS_KEY_ID", ""),
+			getenv("AWS_SECRET_ACCESS_KEY", ""),
+			getenv("AWS_S3_ENDPOINT", ""),
+			getenvBool("AWS_S3_USE_SSL", false),
+			getenvBool("AWS_S3_USE_PATH_STYLE", true),
+		))
+	case "memory":
+		opts = append(opts, simpleconfig.WithMemoryStorage("memory"))
 	}
 
-	return cfg, nil
+	// Service options
+	opts = append(opts,
+		simpleconfig.WithEventLogging(false),
+		simpleconfig.WithPreviews(true),
+		simpleconfig.WithStorageDelegatedURLs(),
+	)
+
+	return simpleconfig.Load(opts...)
+}
+
+func getenvBool(key string, defaultValue bool) bool {
+	val := getenv(key, "")
+	if val == "" {
+		return defaultValue
+	}
+	return val == "true"
 }
 
 func main() {
