@@ -648,9 +648,26 @@ func uploadResultsStep(ctx context.Context, parent *simplecontent.Content, thumb
 		}
 
 		// Upload object for the existing derived content
+		// IMPORTANT: MimeType must be empty to allow auto-detection from the actual thumbnail file
+		//
+		// Context:
+		// - source.MimeType represents the ORIGINAL file's MIME type (e.g., video/mp4, application/pdf)
+		// - thumb.Path is the GENERATED thumbnail file (always JPEG for videos, PNG for PDFs)
+		// - Using source.MimeType would create incorrect metadata in storage
+		//
+		// Examples of what would happen if we used source.MimeType:
+		// - Video (sample.mp4) → Thumbnail (sample_small.jpg) would be labeled as "video/mp4" ❌
+		// - PDF (document.pdf) → Thumbnail (document_small.png) would be labeled as "application/pdf" ❌
+		// - Image (photo.jpg) → Thumbnail (photo_small.jpg) would be labeled as "image/jpeg" ✅ (coincidentally correct)
+		//
+		// By setting MimeType to empty string:
+		// - UploadThumbnailObject calls detectMime() which reads the actual file
+		// - Video thumbnails correctly detected as "image/jpeg" ✅
+		// - PDF thumbnails correctly detected as "image/png" ✅
+		// - Image thumbnails still correctly detected as their actual format ✅
 		_, err := uploader.UploadThumbnailObject(ctx, derivedContentID, thumb.Path, upload.UploadOptions{
 			FileName: source.Filename,
-			MimeType: source.MimeType,
+			MimeType: "", // Empty = auto-detect from thumbnail file (see comment above)
 			Width:    thumb.Width,
 			Height:   thumb.Height,
 		})
