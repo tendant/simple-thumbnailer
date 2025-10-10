@@ -45,10 +45,45 @@ type config struct {
 	ThumbnailSizes []SizeConfig
 }
 
-func loadSimpleContentConfig() (*simpleconfig.ServerConfig, error) {
-	cfg, err := simpleconfig.Load(simpleconfig.WithEnv(""))
-	if err != nil {
-		return nil, fmt.Errorf("unable to load simplecontent config: %w", err)
+func loadSimpleContentConfig() (*simpleconfig.ServiceConfig, error) {
+	// Build ServiceConfig manually with explicit endpoint configuration
+	// This ensures MinIO/S3 endpoint is properly configured
+	cfg := &simpleconfig.ServiceConfig{
+		DatabaseURL:           getenv("DATABASE_URL", ""),
+		DatabaseType:          getenv("DATABASE_TYPE", "postgres"),
+		DBSchema:              getenv("DATABASE_SCHEMA", "content"),
+		DefaultStorageBackend: getenv("DEFAULT_STORAGE_BACKEND", "s3"),
+		EnableEventLogging:    false,
+		EnablePreviews:        true,
+		URLStrategy:           "storage-delegated",
+	}
+
+	// Configure S3 storage backend with explicit endpoint
+	if cfg.DefaultStorageBackend == "s3" {
+		cfg.StorageBackends = []simpleconfig.StorageBackendConfig{
+			{
+				Name: "s3",
+				Type: "s3",
+				Config: map[string]interface{}{
+					"region":            getenv("AWS_S3_REGION", "us-east-1"),
+					"bucket":            getenv("AWS_S3_BUCKET", "xchangeai-content"),
+					"access_key_id":     getenv("AWS_ACCESS_KEY_ID", ""),
+					"secret_access_key": getenv("AWS_SECRET_ACCESS_KEY", ""),
+					"endpoint":          getenv("AWS_S3_ENDPOINT", ""),
+					"use_ssl":           getenv("AWS_S3_USE_SSL", "false") == "true",
+					"use_path_style":    getenv("AWS_S3_USE_PATH_STYLE", "true") == "true",
+					"presign_duration":  3600,
+				},
+			},
+		}
+	} else if cfg.DefaultStorageBackend == "memory" {
+		cfg.StorageBackends = []simpleconfig.StorageBackendConfig{
+			{
+				Name:   "memory",
+				Type:   "memory",
+				Config: map[string]interface{}{},
+			},
+		}
 	}
 
 	return cfg, nil
@@ -473,13 +508,13 @@ func parseThumbnailSizesHint(hints map[string]string, availableSizes []SizeConfi
 }
 
 type ProcessingState struct {
-	JobID              string
-	ParentContentID    string
-	ParentStatus       string
-	ThumbnailSizes     []string
-	DerivedContentIDs  map[string]uuid.UUID // size name -> derived content ID
-	StartTime          time.Time
-	Lifecycle          []schema.ThumbnailLifecycleEvent
+	JobID             string
+	ParentContentID   string
+	ParentStatus      string
+	ThumbnailSizes    []string
+	DerivedContentIDs map[string]uuid.UUID // size name -> derived content ID
+	StartTime         time.Time
+	Lifecycle         []schema.ThumbnailLifecycleEvent
 }
 
 func (ps *ProcessingState) AddLifecycleEvent(stage schema.ProcessingStage, err error, failureType schema.FailureType) {
@@ -629,10 +664,10 @@ func uploadResultsStep(ctx context.Context, parent *simplecontent.Content, thumb
 
 			// Add failed result
 			results = append(results, schema.ThumbnailResult{
-				Size:    thumb.Name,
-				Width:   thumb.Width,
-				Height:  thumb.Height,
-				Status:  "failed",
+				Size:   thumb.Name,
+				Width:  thumb.Width,
+				Height: thumb.Height,
+				Status: "failed",
 				DerivationParams: &schema.DerivationParams{
 					SourceWidth:    thumb.SourceWidth,
 					SourceHeight:   thumb.SourceHeight,
@@ -651,10 +686,10 @@ func uploadResultsStep(ctx context.Context, parent *simplecontent.Content, thumb
 			logger.Error("update content status to processed failed", "size", thumb.Name, "content_id", derivedContentID, "err", err)
 			// Continue with failed status but log the error
 			results = append(results, schema.ThumbnailResult{
-				Size:    thumb.Name,
-				Width:   thumb.Width,
-				Height:  thumb.Height,
-				Status:  "failed",
+				Size:   thumb.Name,
+				Width:  thumb.Width,
+				Height: thumb.Height,
+				Status: "failed",
 				DerivationParams: &schema.DerivationParams{
 					SourceWidth:    thumb.SourceWidth,
 					SourceHeight:   thumb.SourceHeight,
