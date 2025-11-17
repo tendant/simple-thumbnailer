@@ -45,6 +45,9 @@ pdftoppm -v
 # Build worker
 go build -tags nats ./cmd/worker
 
+# Build thumbnail-worker (NATS-based thumbnail generator)
+go build -tags nats ./cmd/thumbnail-worker
+
 # Build backfill tool
 go build -tags nats ./cmd/backfill
 
