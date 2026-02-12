@@ -665,20 +665,20 @@ func main() {
 	}
 	contentCfg.URLStrategy = cfg.URLStrategy
 
-	// Apply advanced S3 configuration (endpoint, path-style, SSL) for MinIO support
-	if cfg.Environment == "dev" && cfg.StorageBackend == "s3" && cfg.S3Config.Endpoint != "" {
+	// Apply advanced S3 configuration (endpoint, path-style, SSL) when custom endpoint is provided
+	if cfg.StorageBackend == "s3" && cfg.S3Config.Endpoint != "" {
 		for i := range contentCfg.StorageBackends {
 			if contentCfg.StorageBackends[i].Type == "s3" {
 				contentCfg.StorageBackends[i].Config["endpoint"] = cfg.S3Config.Endpoint
 				// Determine SSL from endpoint URL
 				useSSL := len(cfg.S3Config.Endpoint) > 8 && cfg.S3Config.Endpoint[:8] == "https://"
 				contentCfg.StorageBackends[i].Config["use_ssl"] = useSSL
-				// MinIO requires path-style addressing
+				// Custom S3-compatible providers usually require path-style addressing
 				contentCfg.StorageBackends[i].Config["use_path_style"] = true
 				if cfg.S3Config.PresignDuration > 0 {
 					contentCfg.StorageBackends[i].Config["presign_duration"] = cfg.S3Config.PresignDuration
 				}
-				logger.Info("applied MinIO S3 config", "endpoint", cfg.S3Config.Endpoint, "use_ssl", useSSL)
+				logger.Info("applied custom S3 endpoint config", "endpoint", cfg.S3Config.Endpoint, "use_ssl", useSSL)
 			}
 		}
 	}
