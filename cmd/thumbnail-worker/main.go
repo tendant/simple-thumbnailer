@@ -325,8 +325,8 @@ func uploadResultsStep(ctx context.Context, parent *simplecontent.Content, thumb
 		}
 
 		_, err := uploader.UploadThumbnailObject(ctx, derivedContentID, thumb.Path, upload.UploadOptions{
-			FileName: source.Filename,
-			MimeType: source.MimeType,
+			FileName: filepath.Base(thumb.Path),
+			MimeType: "image/jpeg",
 			Width:    thumb.Width,
 			Height:   thumb.Height,
 		})
@@ -564,7 +564,14 @@ func handleJob(ctx context.Context, job contracts.Job, cfg WorkerConfig, thumbna
 		}
 	}
 
-	thumbnails, err := img.GenerateThumbnails(source.Path, basePath, specs)
+	generator, err := img.GetGenerator(source.MimeType)
+	if err != nil {
+		contentLogger.Warn("unsupported file type, falling back to image generator", "mime_type", source.MimeType, "err", err)
+		generator = &img.ImageGenerator{}
+	}
+	contentLogger.Info("using generator", "generator", generator.Name(), "mime_type", source.MimeType)
+
+	thumbnails, err := generator.Generate(ctx, source.Path, basePath, specs)
 	if err != nil {
 		contentLogger.Error("thumbnail generation failed", "err", err)
 		failureType := classifyError(err)
@@ -572,7 +579,7 @@ func handleJob(ctx context.Context, job contracts.Job, cfg WorkerConfig, thumbna
 		publishEventsStep(nc, cfg.ResultSubject, state, nil, sourcePath, err, failureType)
 		return fmt.Errorf("generate thumbnails: %w", err)
 	}
-	contentLogger.Info("thumbnails generated", "count", len(thumbnails))
+	contentLogger.Info("thumbnails generated", "count", len(thumbnails), "generator", generator.Name())
 
 	state.AddLifecycleEvent(schema.StageUpload, nil, "")
 	publishLifecycleEvent(nc, cfg.ResultSubject, state.Lifecycle[len(state.Lifecycle)-1])

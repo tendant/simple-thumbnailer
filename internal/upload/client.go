@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/google/uuid"
 	simplecontent "github.com/tendant/simple-content/pkg/simplecontent"
@@ -67,6 +68,11 @@ func (c *Client) FetchSource(ctx context.Context, contentID uuid.UUID) (*Source,
 			filename = meta.FileName
 		}
 		mimeType = meta.MimeType
+	}
+
+	// Fall back to inferring MIME type from filename extension if still empty
+	if mimeType == "" {
+		mimeType = mimeTypeFromFilename(filename)
 	}
 
 	cleanup := func() error {
@@ -194,6 +200,35 @@ func (c *Client) UploadThumbnailObject(ctx context.Context, contentID uuid.UUID,
 	_ = info
 
 	return &UploadResult{Content: content}, nil
+}
+
+// mimeTypeFromFilename infers a MIME type from a file's extension.
+func mimeTypeFromFilename(filename string) string {
+	ext := strings.ToLower(filepath.Ext(filename))
+	switch ext {
+	case ".mp4":
+		return "video/mp4"
+	case ".mov":
+		return "video/quicktime"
+	case ".avi":
+		return "video/x-msvideo"
+	case ".webm":
+		return "video/webm"
+	case ".mkv":
+		return "video/x-matroska"
+	case ".jpg", ".jpeg":
+		return "image/jpeg"
+	case ".png":
+		return "image/png"
+	case ".gif":
+		return "image/gif"
+	case ".webp":
+		return "image/webp"
+	case ".pdf":
+		return "application/pdf"
+	default:
+		return ""
+	}
 }
 
 func detectMime(path string) (string, error) {
