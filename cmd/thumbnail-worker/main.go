@@ -326,7 +326,6 @@ func uploadResultsStep(ctx context.Context, parent *simplecontent.Content, thumb
 
 		_, err := uploader.UploadThumbnailObject(ctx, derivedContentID, thumb.Path, upload.UploadOptions{
 			FileName: filepath.Base(thumb.Path),
-			MimeType: "image/jpeg",
 			Width:    thumb.Width,
 			Height:   thumb.Height,
 		})
@@ -566,8 +565,16 @@ func handleJob(ctx context.Context, job contracts.Job, cfg WorkerConfig, thumbna
 
 	generator, err := img.GetGenerator(source.MimeType)
 	if err != nil {
-		contentLogger.Warn("unsupported file type, falling back to image generator", "mime_type", source.MimeType, "err", err)
-		generator = &img.ImageGenerator{}
+		if source.MimeType == "" {
+			contentLogger.Warn("unknown MIME type, falling back to image generator", "err", err)
+			generator = &img.ImageGenerator{}
+		} else {
+			contentLogger.Error("unsupported MIME type", "mime_type", source.MimeType, "err", err)
+			failureType := schema.FailureTypePermanent
+			state.AddLifecycleEvent(schema.StageFailed, err, failureType)
+			publishEventsStep(nc, cfg.ResultSubject, state, nil, sourcePath, err, failureType)
+			return err
+		}
 	}
 	contentLogger.Info("using generator", "generator", generator.Name(), "mime_type", source.MimeType)
 
