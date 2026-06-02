@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"mime"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -326,7 +327,7 @@ func uploadResultsStep(ctx context.Context, parent *simplecontent.Content, thumb
 
 		_, err := uploader.UploadThumbnailObject(ctx, derivedContentID, thumb.Path, upload.UploadOptions{
 			FileName: source.Filename,
-			MimeType: source.MimeType,
+			MimeType: thumbnailUploadMimeType(thumb, source),
 			Width:    thumb.Width,
 			Height:   thumb.Height,
 		})
@@ -437,6 +438,35 @@ func buildThumbPath(baseDir, contentID, name string) string {
 		base = "source"
 	}
 	return filepath.Join(baseDir, contentID+"_thumb_"+base)
+}
+
+func generateThumbnailsForSource(ctx context.Context, source *upload.Source, basePath string, specs []img.ThumbnailSpec) ([]img.ThumbnailOutput, error) {
+	if source == nil {
+		return nil, errors.New("source is required")
+	}
+
+	mimeType := strings.TrimSpace(source.MimeType)
+	if mimeType == "" {
+		return img.GenerateThumbnails(source.Path, basePath, specs)
+	}
+
+	generator, err := img.GetGenerator(mimeType)
+	if err != nil {
+		return nil, fmt.Errorf("select thumbnail generator: %w", err)
+	}
+	return generator.Generate(ctx, source.Path, basePath, specs)
+}
+
+func thumbnailUploadMimeType(thumb img.ThumbnailOutput, source *upload.Source) string {
+	if ext := filepath.Ext(thumb.Path); ext != "" {
+		if mimeType := mime.TypeByExtension(ext); mimeType != "" {
+			return mimeType
+		}
+	}
+	if source != nil {
+		return source.MimeType
+	}
+	return ""
 }
 
 func handleJob(ctx context.Context, job contracts.Job, cfg WorkerConfig, thumbnailSizes []SizeConfig, contentSvc simplecontent.Service, uploader *upload.Client, nc *bus.Client, logger *slog.Logger) error {
@@ -552,7 +582,7 @@ func handleJob(ctx context.Context, job contracts.Job, cfg WorkerConfig, thumbna
 	if name == "" {
 		name = "thumbnail.png"
 	}
-	contentLogger.Info("resolved thumbnail filename", "name", name)
+	contentLogger.Info("resolved thumbnail filename", "name", name, "mime_type", source.MimeType)
 
 	basePath := buildThumbPath(cfg.ThumbDir, contentID.String(), name)
 	specs := make([]img.ThumbnailSpec, len(thumbnailSizesForJob))
@@ -564,7 +594,7 @@ func handleJob(ctx context.Context, job contracts.Job, cfg WorkerConfig, thumbna
 		}
 	}
 
-	thumbnails, err := img.GenerateThumbnails(source.Path, basePath, specs)
+	thumbnails, err := generateThumbnailsForSource(ctx, source, basePath, specs)
 	if err != nil {
 		contentLogger.Error("thumbnail generation failed", "err", err)
 		failureType := classifyError(err)
